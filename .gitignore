@@ -1,0 +1,74 @@
+# BepInEx
+BepInEx/
+unstripped_corlibs/
+
+# Unity
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+
+# Visual Studio
+/[Vv]s/
+.vs/
+.vscode/
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Rider
+.idea/
+*.sln.iml
+
+# Builds
+/build/
+/Build/
+/builds/
+/Builds/
+
+# Miscellaneous
+*.booproj
+*.pidb
+*.suo
+*.user
+*.userprefs
+*.unityproj
+*.dll
+*.exe
+*.pdf
+*.doc
+*.docx
+*.odt
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.mdb
+*.opendb
+*.VC.db
+*~
+*.*~
+*.swp
+Thumbs.db
+desktop.ini
+
+# Folders
+bin/
+obj/
+libs/
+Demosaic-il2cpp/bin/
+Demosaic-il2cpp/obj/
+Demosaic-il2cpp/libs/
+Demosaic-mono/bin/
+Demosaic-mono/obj/
+Demosaic-mono/libs/
