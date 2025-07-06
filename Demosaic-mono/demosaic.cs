@@ -23,7 +23,7 @@ namespace DemosaicPlugin
     // =================================================================================
     // 主插件类
     // =================================================================================
-    [BepInPlugin("demosaic", "Demosaic", "1.0.0")] 
+    [BepInPlugin("demosaic", "Demosaic", "1.1.0")] 
     public class DemosaicPlugin : BaseUnityPlugin
     {
         public static DemosaicPlugin Instance { get; private set; }
@@ -138,17 +138,17 @@ namespace DemosaicPlugin
             _scanBatchSize = Config.Bind("2. 扫描", "ScanBatchSize", 500, "全场景扫描时每帧处理的对象数量，以防止卡顿。");
 
             // --- 关键词 ---
-            _objectNameKeywords = Config.Bind("3. 关键词", "ObjectNameKeywords", "mosaic,censored,pixelated,h-mosaic", "用于通过名称识别马赛克游戏对象的关键词（逗号分隔）。");
-            _materialNameKeywords = Config.Bind("3. 关键词", "MaterialNameKeywords", "mosaic,censored,pixel,h-mosaic", "用于通过名称识别马赛克材质的关键词（逗号分隔）。");
+            _objectNameKeywords = Config.Bind("3. 关键词", "ObjectNameKeywords", "mosaic,censored,pixelated", "用于通过名称识别马赛克游戏对象的关键词（逗号分隔）。");
+            _materialNameKeywords = Config.Bind("3. 关键词", "MaterialNameKeywords", "mosaic,censored,pixel", "用于通过名称识别马赛克材质的关键词（逗号分隔）。");
             _shaderNameKeywords = Config.Bind("3. 关键词", "ShaderNameKeywords", "mosaic,pixelate,censor", "用于通过名称识别马赛克着色器的关键词（逗号分隔）。");
             _meshNameKeywords = Config.Bind("3. 关键词", "MeshNameKeywords", "censor,mosaic", "用于通过名称识别马赛克网格的关键词（逗号分隔）。");
             _textureKeywords = Config.Bind("3. 关键词", "TextureKeywords", "mosaic", "用于在纹理名称中检查的关键词（逗号分隔）。");
-            _componentNameKeywords = Config.Bind("3. 关键词", "ComponentNameKeywords", "MosaicEffect,CensorEffect", "【新增】用于通过附加的脚本组件名称识别的关键词（逗号分隔）。");
-            _shaderPropertyKeywords = Config.Bind("3. 关键词", "ShaderPropertyKeywords", "_PixelSize,_BlockSize,_MosaicFactor", "【新增】用于通过着色器属性名称识别的关键词（逗号分隔）。");
+            _componentNameKeywords = Config.Bind("3. 关键词", "ComponentNameKeywords", "MosaicEffect,CensorEffect", "用于通过附加的脚本组件名称识别的关键词（逗号分隔）。");
+            _shaderPropertyKeywords = Config.Bind("3. 关键词", "ShaderPropertyKeywords", "_PixelSize,_BlockSize,_MosaicFactor", "用于通过着色器属性名称识别的关键词（逗号分隔）。");
 
             // --- 高级设置 ---
             _disableMethods = Config.Bind("4. 高级", "DisableMethods", false, "启用或禁用按名称修补方法的功能。这是一个高级功能。");
-            _methodDisableKeywords = Config.Bind("4. 高级", "MethodDisableKeywords", "Mosa,Mosaic,Censor", "要禁用的方法名称的关键词（逗号分隔）。");
+            _methodDisableKeywords = Config.Bind("4. 高级", "MethodDisableKeywords", "censor,mosaic", "要禁用的方法名称的关键词（逗号分隔）。");
             _assemblyNamesToPatch = Config.Bind("4. 高级", "AssemblyNamesToPatch", "Assembly-CSharp", "要在其中搜索并修补方法的程序集名称列表（逗号分隔）。");
         }
 
@@ -167,6 +167,18 @@ namespace DemosaicPlugin
                 {
                     Log.LogError("未能找到需要修补的 GameObject.SetActive。");
                 }
+
+                var instantiateOriginal = AccessTools.Method(typeof(UnityEngine.Object), "Instantiate", new Type[] { typeof(UnityEngine.Object) });
+                if (instantiateOriginal != null)
+                {
+                    var instantiatePostfix = new HarmonyMethod(typeof(DemosaicPlugin), nameof(InstantiatePatch));
+                    _harmony.Patch(instantiateOriginal, postfix: instantiatePostfix);
+                    Log.LogInfo("成功修补 UnityEngine.Object.Instantiate。");
+                }
+                else
+                {
+                    Log.LogError("未能找到需要修补的 UnityEngine.Object.Instantiate。");
+                }
             }
             catch (Exception e)
             {
@@ -179,6 +191,14 @@ namespace DemosaicPlugin
             if (value && Instance != null)
             {
                 Instance.ProcessObject(__instance);
+            }
+        }
+
+        private static void InstantiatePatch(UnityEngine.Object __result)
+        {
+            if (__result is GameObject go && Instance != null)
+            {
+                Instance.ProcessObject(go);
             }
         }
 

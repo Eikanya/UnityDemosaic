@@ -9,8 +9,10 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using Component = UnityEngine.Component;
 
 namespace DemosaicPlugin
 {
@@ -23,7 +25,7 @@ namespace DemosaicPlugin
     // =================================================================================
     // 主插件类
     // =================================================================================
-    [BepInPlugin("demosaic", "Demosaic", "1.0.0")]
+    [BepInPlugin("demosaic", "Demosaic", "1.1.0")] 
     public class DemosaicPlugin : BasePlugin
     {
         // 配置项
@@ -33,18 +35,20 @@ namespace DemosaicPlugin
         private ConfigEntry<string> shaderKeywords;
         private ConfigEntry<string> meshKeywords;
         private ConfigEntry<string> exclusionKeywords;
+        private ConfigEntry<string> componentNameKeywords;
+        private ConfigEntry<string> shaderPropertyKeywords;
         private ConfigEntry<string> methodDisableKeywords;
         private ConfigEntry<string> methodPatchTargetAssemblies;
         private ConfigEntry<KeyCode> forceScanHotkey;
-        private ConfigEntry<float> periodicScanInterval;
         internal KeyCode ForceScanHotkeyValue => forceScanHotkey.Value;
-        internal float PeriodicScanIntervalValue => periodicScanInterval.Value;
 
         // 优化字段
         private List<string> keywordList;
         private List<string> shaderKeywordList;
         private List<string> meshKeywordList;
         private List<string> exclusionKeywordList;
+        private List<string> componentNameKeywordList;
+        private List<string> shaderPropertyKeywordList;
         private List<string> methodDisableKeywordList;
         private readonly HashSet<Renderer> processedRenderers = new HashSet<Renderer>();
         private Material transparentMaterial;
@@ -56,48 +60,43 @@ namespace DemosaicPlugin
         // 单例，方便补丁代码访问
         public static DemosaicPlugin Instance { get; private set; }
 
-        // 静态日志实例，方便在任何地方（尤其是静态补丁中）访问
+        // 静态日志实例
         internal static ManualLogSource Logger { get; private set; }
 
         // 关键词常量
         private const string DefaultKeywords = "mosaic,censor";
         private const string DefaultShaderKeywords = "mosaic,censor";
         private const string DefaultMeshKeywords = "mosaic,censor";
-        private const string DefaultExclusionKeywords = ""; // 默认留空，让用户按需添加
+        private const string DefaultExclusionKeywords = "";
+        private const string DefaultComponentNameKeywords = "MosaicEffect,CensorEffect";
+        private const string DefaultShaderPropertyKeywords = "_PixelSize,_BlockSize,_MosaicFactor";
 
         public override void Load()
         {
             Instance = this;
-            Logger = Log; // 从 BasePlugin 获取实例日志记录器并赋值给静态成员
+            Logger = Log;
 
             SetupConfiguration();
 
             if (!enablePlugin.Value) return;
 
-            // 注册自定义 MonoBehaviour 以便在 IL2CPP 中使用
             ClassInjector.RegisterTypeInIl2Cpp<PluginLifecycleManager>();
 
-            // 初始化负责检测和处理的核心服务
             mosaicDetector = new MosaicDetector(Logger);
             ReloadAllKeywords();
 
-            // 创建共享的透明材质
             CreateTransparentMaterial();
-            // 根据当前配置创建处理器
             mosaicProcessor = new MosaicProcessor(removeMode.Value, transparentMaterial, Logger);
 
-            // 使用 BepInEx 辅助方法添加组件，它会自动处理 GameObject 创建、IL2CPP 类型注册和持久化
             lifecycleManager = AddComponent<PluginLifecycleManager>();
             Logger.LogInfo(string.Format("Demosaic 插件加载成功！去除方式: {0}, 强制刷新快捷键: {1}", removeMode.Value, forceScanHotkey.Value));
 
-            // 应用 Harmony 补丁
             try
             {
                 harmony = new Harmony("demosaic");
                 harmony.PatchAll(typeof(DemosaicPlugin).Assembly);
                 Logger.LogInfo("Harmony 补丁应用成功，已启用实时对象处理。");
 
-                // 动态地按名称查找并修补方法
                 PatchMethodsByName(harmony);
             }
             catch (System.Exception e)
@@ -108,24 +107,22 @@ namespace DemosaicPlugin
 
         private void SetupConfiguration()
         {
-            // 初始化配置
             enablePlugin = Config.Bind("General", "Enable", true, "是否启用去马赛克插件");
-            periodicScanInterval = Config.Bind("General", "PeriodicScanInterval", 0f, "周期性扫描的间隔时间（秒）。设为0则禁用。这是一个“最终兜底”选项，用于处理在同一场景内动态加载且无法被实时补丁捕获的内容。注意：频繁扫描可能会对性能产生影响。");
             forceScanHotkey = Config.Bind("General", "ForceScanHotkey", KeyCode.F10, "按下此快捷键可强制重新扫描并移除所有马赛克");
-            keywords = Config.Bind("Detection", "Keywords", DefaultKeywords, "检测马赛克的关键词，逗号分隔");
+            
+            keywords = Config.Bind("Detection", "Keywords", DefaultKeywords, "检测对象/材质/纹理名称的关键词，逗号分隔");
             shaderKeywords = Config.Bind("Detection", "ShaderKeywords", DefaultShaderKeywords, "检测马赛克着色器的关键词，逗号分隔");
             meshKeywords = Config.Bind("Detection", "MeshKeywords", DefaultMeshKeywords, "检测马赛克网格的关键词，逗号分隔");
+            componentNameKeywords = Config.Bind("Detection", "ComponentNameKeywords", DefaultComponentNameKeywords, "检测组件名称的关键词，逗号分隔");
+            shaderPropertyKeywords = Config.Bind("Detection", "ShaderPropertyKeywords", DefaultShaderPropertyKeywords, "检测着色器属性的关键词，逗号分隔");
             exclusionKeywords = Config.Bind("Detection", "ExclusionKeywords", DefaultExclusionKeywords, "如果对象名称包含这些关键词，则会跳过检测（最高优先级），逗号分隔");
 
-            methodDisableKeywords = Config.Bind("Advanced", "MethodDisableKeywords", "censor", "如果方法名包含这些关键词，则会尝试禁用该方法（高级功能，需要重启游戏生效），逗号分隔");
+            methodDisableKeywords = Config.Bind("Advanced", "MethodDisableKeywords", "censor,mosaic", "如果方法名包含这些关键词，则会尝试禁用该方法（高级功能，需要重启游戏生效），逗号分隔");
             methodPatchTargetAssemblies = Config.Bind("Advanced", "MethodPatchTargetAssemblies", "Assembly-CSharp", "需要进行方法扫描的目标程序集名称，逗号分隔。留空则扫描所有程序集（可能很慢）。");
 
-            removeMode = Config.Bind("Remove", "Mode", RemoveMode.Disable, "去除方式：Disable=禁用Renderer，Transparent=替换为透明材质");
+            removeMode = Config.Bind("Remove", "Mode", RemoveMode.Disable, "去除方式：Disable=禁用GameObject，Transparent=替换为透明材质");
 
-            // 监听配置文件更改事件，实现热重载
             Config.SettingChanged += OnSettingChanged;
-
-            // 强制保存一次配置，确保文件在首次加载时生成
             Config.Save();
         }
 
@@ -136,22 +133,38 @@ namespace DemosaicPlugin
             shaderKeywordList = ParseKeywordString(shaderKeywords.Value);
             meshKeywordList = ParseKeywordString(meshKeywords.Value);
             exclusionKeywordList = ParseKeywordString(exclusionKeywords.Value);
-            mosaicDetector.UpdateKeywords(keywordList, shaderKeywordList, meshKeywordList, exclusionKeywordList);
+            componentNameKeywordList = ParseKeywordString(componentNameKeywords.Value);
+            shaderPropertyKeywordList = ParseKeywordString(shaderPropertyKeywords.Value);
 
-            // 此列表在启动时加载；更改需要重启游戏才能生效
+            mosaicDetector.UpdateKeywords(keywordList, shaderKeywordList, meshKeywordList, exclusionKeywordList, componentNameKeywordList, shaderPropertyKeywordList);
+
             methodDisableKeywordList = ParseKeywordString(methodDisableKeywords.Value);
         }
 
         private void CreateTransparentMaterial()
         {
             var shader = Shader.Find("Unlit/Transparent");
+            if (shader == null) shader = Shader.Find("Standard");
+
             if (shader != null)
             {
-                transparentMaterial = new Material(shader) { color = Color.clear };
+                transparentMaterial = new Material(shader);
+                if (shader.name == "Standard")
+                {
+                    transparentMaterial.SetFloat("_Mode", 3);
+                    transparentMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                    transparentMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                    transparentMaterial.SetInt("_ZWrite", 0);
+                    transparentMaterial.DisableKeyword("_ALPHATEST_ON");
+                    transparentMaterial.EnableKeyword("_ALPHABLEND_ON");
+                    transparentMaterial.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+                    transparentMaterial.renderQueue = 3000;
+                }
+                transparentMaterial.color = Color.clear;
             }
             else
             {
-                Logger.LogError("找不到 Unlit/Transparent shader。透明模式可能无法正常工作。");
+                Logger.LogError("找不到 Unlit/Transparent 或 Standard shader。透明模式可能无法正常工作。");
             }
         }
 
@@ -163,29 +176,19 @@ namespace DemosaicPlugin
                 .ToList();
         }
 
-        /// <summary>
-        /// 启动或重启扫描协程
-        /// </summary>
         internal void StartScan()
         {
-            if (lifecycleManager != null)
-            {
-                lifecycleManager.StartScanCoroutine();
-            }
+            lifecycleManager?.ScanAllRenderers();
         }
 
-        /// <summary>
-        /// 检查并处理单个Renderer，返回是否进行了处理。
-        /// </summary>
         internal bool ProcessRenderer(Renderer renderer)
         {
-            // 跳过无效、已禁用或已处理的Renderer
             if (renderer == null || !renderer.enabled || processedRenderers.Contains(renderer)) return false;
 
             if (mosaicDetector.IsMosaic(renderer))
             {
                 mosaicProcessor.Process(renderer);
-                processedRenderers.Add(renderer); 
+                processedRenderers.Add(renderer);
                 return true;
             }
             return false;
@@ -196,14 +199,9 @@ namespace DemosaicPlugin
             processedRenderers.Clear();
         }
 
-        /// <summary>
-        /// 公开一个方法，供Harmony补丁调用，用于处理新激活或实例化的游戏对象
-        /// </summary>
         public void ProcessNewGameObject(GameObject go)
         {
             if (go == null || !go.activeInHierarchy) return;
-
-            // 查找新对象及其所有子对象中的Renderer
             foreach (var renderer in go.GetComponentsInChildren<Renderer>(true))
             {
                 ProcessRenderer(renderer);
@@ -213,7 +211,7 @@ namespace DemosaicPlugin
         private void OnSettingChanged(object sender, SettingChangedEventArgs e)
         {
             var key = e.ChangedSetting.Definition.Key;
-            if (key == keywords.Definition.Key || key == shaderKeywords.Definition.Key || key == meshKeywords.Definition.Key || key == exclusionKeywords.Definition.Key)
+            if (key.Contains("Keywords"))
             {
                 ReloadAllKeywords();
             }
@@ -226,10 +224,7 @@ namespace DemosaicPlugin
 
         private void PatchMethodsByName(Harmony harmonyInstance)
         {
-            if (methodDisableKeywordList == null || methodDisableKeywordList.Count == 0)
-            {
-                return; // 没有配置关键词，跳过扫描
-            }
+            if (methodDisableKeywordList == null || methodDisableKeywordList.Count == 0) return;
 
             Logger.LogInfo("开始动态扫描并禁用匹配关键词的方法...");
             int patchedCount = 0;
@@ -244,7 +239,6 @@ namespace DemosaicPlugin
                 .Where(asm =>
                 {
                     if (asm.IsDynamic) return false;
-                    // 如果用户没有指定程序集，则扫描所有非系统程序集
                     if (targetAssemblyNames.Count == 0)
                     {
                         try
@@ -253,7 +247,6 @@ namespace DemosaicPlugin
                         }
                         catch { return false; }
                     }
-                    // 否则，只扫描用户指定的程序集
                     return targetAssemblyNames.Contains(asm.GetName().Name);
                 })
                 .ToList();
@@ -264,15 +257,13 @@ namespace DemosaicPlugin
             {
                 try
                 {
-                    var types = assembly.GetTypes();
-                    foreach (var type in types)
+                    foreach (var type in assembly.GetTypes())
                     {
-                        var methods = type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static);
-                        foreach (var method in methods)
+                        foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
                         {
                             if (method.IsSpecialName || method.IsGenericMethod || method.IsAbstract) continue;
 
-                            if (methodDisableKeywordList.Any(keyword => method.Name.IndexOf(keyword, System.StringComparison.OrdinalIgnoreCase) >= 0))
+                            if (methodDisableKeywordList.Any(keyword => method.Name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0))
                             {
                                 try
                                 {
@@ -282,14 +273,13 @@ namespace DemosaicPlugin
                                 }
                                 catch (Exception patchEx)
                                 {
-                                    
                                     Logger.LogWarning(string.Format("修补方法 {0} 时失败: {1}", method.Name, patchEx.Message));
                                 }
                             }
                         }
                     }
                 }
-                catch (System.Reflection.ReflectionTypeLoadException ex)
+                catch (ReflectionTypeLoadException ex)
                 {
                     Logger.LogWarning(string.Format("无法完全加载程序集 {0} 中的类型，已跳过。错误: {1}", assembly.FullName, ex.Message));
                 }
@@ -318,15 +308,14 @@ namespace DemosaicPlugin
 
     #region Helper Components and Patches
 
-    /// <summary>
-    /// 负责检测一个渲染器是否是马赛克。
-    /// </summary>
     public class MosaicDetector
     {
         private List<string> keywordList;
         private List<string> shaderKeywordList;
         private List<string> meshKeywordList;
         private List<string> exclusionKeywordList;
+        private List<string> componentNameKeywordList;
+        private List<string> shaderPropertyKeywordList;
         private readonly ManualLogSource logger;
 
         public MosaicDetector(ManualLogSource logger)
@@ -334,46 +323,80 @@ namespace DemosaicPlugin
             this.logger = logger;
         }
 
-        public void UpdateKeywords(List<string> keywords, List<string> shaderKeywords, List<string> meshKeywords, List<string> exclusionKeywords)
+        public void UpdateKeywords(List<string> keywords, List<string> shaderKeywords, List<string> meshKeywords, List<string> exclusionKeywords, List<string> componentKeywords, List<string> shaderPropertyKeywords)
         {
             keywordList = keywords;
             shaderKeywordList = shaderKeywords;
             meshKeywordList = meshKeywords;
             exclusionKeywordList = exclusionKeywords;
+            componentNameKeywordList = componentKeywords;
+            shaderPropertyKeywordList = shaderPropertyKeywords;
         }
 
         public bool IsMosaic(Renderer renderer)
         {
-            // 1. 排除检测 (最高优先级)
-            if (NameContainsKeyword(renderer.name, exclusionKeywordList))
-            {
-                return false;
-            }
+            var go = renderer.gameObject;
 
-            // 2. 包含检测
-            if (CheckAndLog(renderer.name, keywordList, "对象名检测")) return true;
+            if (NameContainsKeyword(go.name, exclusionKeywordList)) return false;
+            if (CheckAndLog(go.name, keywordList, "对象名检测")) return true;
 
-            // 检查网格名
             Mesh mesh = (renderer is SkinnedMeshRenderer smr)
                 ? smr.sharedMesh
                 : (renderer.GetComponent<MeshFilter>() is { } meshFilter ? meshFilter.sharedMesh : null);
             if (mesh != null && CheckAndLog(mesh.name, meshKeywordList, "网格名检测")) return true;
 
-            // 检查所有材质
             foreach (var mat in renderer.sharedMaterials)
             {
                 if (mat == null) continue;
                 if (CheckAndLog(mat.name, keywordList, "材质名检测")) return true;
-                if (mat.shader != null && CheckAndLog(mat.shader.name, shaderKeywordList, "着色器检测")) return true;
-                if (mat.mainTexture != null && CheckAndLog(mat.mainTexture.name, keywordList, "纹理名检测")) return true;
+                if (mat.shader != null)
+                {
+                    if (CheckAndLog(mat.shader.name, shaderKeywordList, "着色器检测")) return true;
+                    if (CheckShaderProperties(mat)) return CheckAndLog(mat.name, new List<string> { "着色器属性检测" }, "着色器属性检测");
+                }
+                if (CheckTextures(mat)) return CheckAndLog(mat.name, new List<string> { "纹理名检测" }, "纹理名检测");
             }
 
+            if (CheckComponents(go)) return CheckAndLog(go.name, new List<string> { "组件名检测" }, "组件名检测");
+
+            return false;
+        }
+
+        private bool CheckShaderProperties(Material mat)
+        {
+            if (shaderPropertyKeywordList == null || shaderPropertyKeywordList.Count == 0) return false;
+            for (int i = 0; i < mat.shader.GetPropertyCount(); i++)
+            {
+                if (NameContainsKeyword(mat.shader.GetPropertyName(i), shaderPropertyKeywordList)) return true;
+            }
+            return false;
+        }
+
+        private bool CheckTextures(Material mat)
+        {
+            if (keywordList == null || keywordList.Count == 0) return false;
+            var texturePropertyIDs = mat.GetTexturePropertyNameIDs();
+            foreach (var propID in texturePropertyIDs)
+            {
+                var texture = mat.GetTexture(propID);
+                if (texture != null && NameContainsKeyword(texture.name, keywordList)) return true;
+            }
+            return false;
+        }
+
+        private bool CheckComponents(GameObject go)
+        {
+            if (componentNameKeywordList == null || componentNameKeywordList.Count == 0) return false;
+            foreach (var component in go.GetComponents<Component>())
+            {
+                if (component != null && NameContainsKeyword(component.GetIl2CppType().Name, componentNameKeywordList)) return true;
+            }
             return false;
         }
 
         private bool NameContainsKeyword(string name, List<string> keywords)
         {
-            if (string.IsNullOrEmpty(name)) return false;
+            if (string.IsNullOrEmpty(name) || keywords == null) return false;
             return keywords.Any(keyword => name.IndexOf(keyword, System.StringComparison.OrdinalIgnoreCase) >= 0);
         }
 
@@ -388,9 +411,6 @@ namespace DemosaicPlugin
         }
     }
 
-    /// <summary>
-    /// 负责处理被检测到的马赛克渲染器。
-    /// </summary>
     public class MosaicProcessor
     {
         private readonly RemoveMode removeMode;
@@ -406,7 +426,6 @@ namespace DemosaicPlugin
 
         public void Process(Renderer renderer)
         {
-            // 优先尝试配置的主模式
             if (removeMode == RemoveMode.Transparent && transparentMaterial != null)
             {
                 var newMaterials = new Il2CppReferenceArray<Material>(renderer.sharedMaterials.Length);
@@ -416,10 +435,9 @@ namespace DemosaicPlugin
                 }
                 renderer.materials = newMaterials;
                 logger.LogDebug("替换为透明材质: " + renderer.name);
-                return; // 处理成功，退出
+                return;
             }
 
-            // 如果主模式是 Disable 或透明模式失败，则回退到禁用 GameObject
             renderer.gameObject.SetActive(false);
             if (removeMode == RemoveMode.Transparent)
             {
@@ -432,21 +450,19 @@ namespace DemosaicPlugin
         }
     }
 
-    /// <summary>
-    /// 处理协程和Unity生命周期事件的专用组件
-    /// </summary>
     public class PluginLifecycleManager : MonoBehaviour
     {
-        // IL2CPP 必需的构造函数
         public PluginLifecycleManager(System.IntPtr ptr) : base(ptr) { }
 
         private System.Action<Scene, LoadSceneMode> _onSceneLoadedAction;
+        private bool _scanQueued = false;
+        private float _scanTimer = 0f;
+        private const float ScanDelay = 2.0f;
 
         void Awake()
         {
             _onSceneLoadedAction = new System.Action<Scene, LoadSceneMode>(OnSceneLoaded);
             SceneManager.sceneLoaded += _onSceneLoadedAction;
-            StartCoroutine(nameof(PeriodicScanCoroutine));
         }
 
         void OnDestroy()
@@ -459,99 +475,59 @@ namespace DemosaicPlugin
 
         void Update()
         {
+            // 处理延迟扫描
+            if (_scanQueued)
+            {
+                _scanTimer += Time.deltaTime;
+                if (_scanTimer >= ScanDelay)
+                {
+                    _scanQueued = false;
+                    DemosaicPlugin.Logger.LogInfo(string.Format("执行延迟同步扫描（延迟 {0} 秒）...", ScanDelay));
+                    ScanAllRenderers();
+                }
+            }
+
+            // 处理热键
             if (DemosaicPlugin.Instance != null && Input.GetKeyDown(DemosaicPlugin.Instance.ForceScanHotkeyValue))
             {
-                DemosaicPlugin.Logger.LogInfo(string.Format("快捷键 [{0}] 被按下，开始强制全场景异步扫描...", DemosaicPlugin.Instance.ForceScanHotkeyValue));
-                StartScanCoroutine();
+                DemosaicPlugin.Logger.LogInfo(string.Format("快捷键 [{0}] 被按下，开始强制全场景同步扫描...", DemosaicPlugin.Instance.ForceScanHotkeyValue));
+                ScanAllRenderers();
             }
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
             if (DemosaicPlugin.Instance == null) return;
-            DemosaicPlugin.Logger.LogInfo(string.Format("场景 '{0}' 加载完成，开始初次异步扫描...", scene.name));
-            StartScanCoroutine();
-
-            StartCoroutine(nameof(DelayedSecondScan), 2.0f);
+            DemosaicPlugin.Logger.LogInfo(string.Format("场景 '{0}' 加载完成，已计划延迟扫描...", scene.name));
+            _scanQueued = true;
+            _scanTimer = 0f;
         }
 
-        public void StartScanCoroutine()
+        public void ScanAllRenderers()
         {
-            StopCoroutine(nameof(ScanAndRemoveCoroutine));
-            StartCoroutine(nameof(ScanAndRemoveCoroutine));
-        }
+            if (DemosaicPlugin.Instance == null) return;
 
-        public IEnumerator DelayedSecondScan(float delay)
-        {
-            yield return new WaitForSeconds(delay);
-            DemosaicPlugin.Logger.LogInfo(string.Format("执行延迟二次扫描（延迟 {0} 秒），以捕获后加载的对象...", delay));
-            StartScanCoroutine();
-        }
-
-        private IEnumerator PeriodicScanCoroutine()
-        {
-            while (true)
-            {
-                if (DemosaicPlugin.Instance == null)
-                {
-                    yield return new WaitForSeconds(5.0f);
-                    continue;
-                }
-
-                float interval = DemosaicPlugin.Instance.PeriodicScanIntervalValue;
-                if (interval > 0)
-                {
-                    yield return new WaitForSeconds(interval);
-
-                    if (DemosaicPlugin.Instance.PeriodicScanIntervalValue > 0)
-                    {
-                        DemosaicPlugin.Logger.LogInfo(string.Format("执行周期性扫描（间隔 {0} 秒）...", interval));
-                        StartScanCoroutine();
-                    }
-                }
-                else
-                {
-                    yield return new WaitForSeconds(5.0f);
-                }
-            }
-        }
-
-        public IEnumerator ScanAndRemoveCoroutine()
-        {
-            if (DemosaicPlugin.Instance == null) yield break;
-
-            DemosaicPlugin.Logger.LogDebug("正在清空已处理对象列表并开始异步扫描...");
+            DemosaicPlugin.Logger.LogDebug("正在清空已处理对象列表并开始同步扫描...");
             DemosaicPlugin.Instance.ClearProcessedRenderers();
             int foundCount = 0;
-            int processedCount = 0;
-            const int yieldInterval = 100;
 
             var renderers = UnityEngine.Object.FindObjectsOfType<Renderer>();
             DemosaicPlugin.Logger.LogInfo(string.Format("开始扫描场景中的 {0} 个渲染器...", renderers.Length));
 
             foreach (var renderer in renderers)
             {
-                processedCount++;
                 if (DemosaicPlugin.Instance.ProcessRenderer(renderer))
                 {
                     foundCount++;
                 }
-
-                if (processedCount % yieldInterval == 0)
-                {
-                    yield return null;
-                }
             }
 
             if (foundCount > 0)
-            {
-                DemosaicPlugin.Logger.LogInfo(string.Format("异步扫描完成，共移除了 {0} 个马赛克对象。", foundCount));
-            }
+                DemosaicPlugin.Logger.LogInfo(string.Format("同步扫描完成，共移除了 {0} 个马赛克对象。", foundCount));
             else
-            {
-                DemosaicPlugin.Logger.LogInfo("异步扫描完成，未发现新的马赛克对象。");
-            }
+                DemosaicPlugin.Logger.LogInfo("同步扫描完成，未发现新的马赛克对象。");
         }
+
     }
 
     [HarmonyPatch(typeof(GameObject), nameof(GameObject.SetActive))]
