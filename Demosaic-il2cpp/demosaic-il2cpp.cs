@@ -25,7 +25,7 @@ namespace DemosaicPlugin
     // =================================================================================
     // 主插件类
     // =================================================================================
-    [BepInPlugin("demosaic", "Demosaic", "1.1.0")] 
+    [BepInPlugin("demosaic", "Demosaic", "1.2.0")] 
     public class DemosaicPlugin : BasePlugin
     {
         // 配置项
@@ -73,6 +73,17 @@ namespace DemosaicPlugin
 
         public override void Load()
         {
+            // 尝试设置控制台输出编码为UTF-8，解决中文乱码问题
+            try
+            {
+                Console.OutputEncoding = System.Text.Encoding.UTF8;
+            }
+            catch (Exception ex)
+            {
+                // 如果无法设置编码（例如在某些受限环境中），记录警告但不阻止插件加载
+                Logger.LogWarning(string.Format("无法设置控制台输出编码为UTF-8: {0}", ex.Message));
+            }
+
             Instance = this;
             Logger = Log;
 
@@ -123,7 +134,6 @@ namespace DemosaicPlugin
             removeMode = Config.Bind("Remove", "Mode", RemoveMode.Disable, "去除方式：Disable=禁用GameObject，Transparent=替换为透明材质");
 
             Config.SettingChanged += OnSettingChanged;
-            Config.Save();
         }
 
         private void ReloadAllKeywords()
@@ -144,7 +154,11 @@ namespace DemosaicPlugin
         private void CreateTransparentMaterial()
         {
             var shader = Shader.Find("Unlit/Transparent");
-            if (shader == null) shader = Shader.Find("Standard");
+            if (shader == null)
+            {
+                Logger.LogWarning("未找到 Unlit/Transparent 着色器，尝试使用 Standard 着色器。");
+                shader = Shader.Find("Standard");
+            }
 
             if (shader != null)
             {
@@ -164,7 +178,7 @@ namespace DemosaicPlugin
             }
             else
             {
-                Logger.LogError("找不到 Unlit/Transparent 或 Standard shader。透明模式可能无法正常工作。");
+                Logger.LogError("未能找到 Unlit/Transparent 或 Standard 着色器。透明模式将无法正常工作。");
             }
         }
 
@@ -426,27 +440,69 @@ namespace DemosaicPlugin
 
         public void Process(Renderer renderer)
         {
-            if (removeMode == RemoveMode.Transparent && transparentMaterial != null)
-            {
-                var newMaterials = new Il2CppReferenceArray<Material>(renderer.sharedMaterials.Length);
-                for (int i = 0; i < newMaterials.Length; i++)
-                {
-                    newMaterials[i] = transparentMaterial;
-                }
-                renderer.materials = newMaterials;
-                logger.LogDebug("替换为透明材质: " + renderer.name);
-                return;
-            }
-
-            renderer.gameObject.SetActive(false);
             if (removeMode == RemoveMode.Transparent)
             {
-                logger.LogWarning("透明材质不可用，已使用备用方案禁用GameObject: " + renderer.name);
+                if (transparentMaterial != null)
+                {
+                    var newMaterials = new Il2CppReferenceArray<Material>(renderer.sharedMaterials.Length);
+                    for (int i = 0; i < newMaterials.Length; i++)
+                    {
+                        newMaterials[i] = transparentMaterial;
+                    }
+                    renderer.materials = newMaterials;
+                    logger.LogInfo("已去除马赛克 (透明模式 - 新材质): " + renderer.name);
+                    return;
+                }
+                else
+                {
+                    // Fallback to modifying existing materials if transparentMaterial is not available
+                    foreach (var mat in renderer.sharedMaterials)
+                    {
+                        if (mat != null)
+                        {
+                            // Set render mode to Fade
+                            mat.SetOverrideTag("RenderType", "Transparent");
+                            mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                            mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                            mat.SetInt("_ZWrite", 0);
+                            mat.DisableKeyword("_ALPHATEST_ON");
+                            mat.EnableKeyword("_ALPHABLEND_ON");
+                            mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+                            mat.renderQueue = 3000;
+
+                            // Try to set _Mode property if it exists (common for Standard shader)
+                            if (mat.HasProperty("_Mode"))
+                            {
+                                mat.SetFloat("_Mode", 3); // 3 for Fade
+                            }
+                            mat.color = Color.clear; // Set to fully transparent
+                        }
+                    }
+                    logger.LogInfo("已去除马赛克 (透明模式 - 修改现有材质): " + renderer.name);
+                    return;
+                }
             }
-            else
+
+            // 如果不是透明模式，或者透明模式的两种尝试都失败，则回退到禁用GameObject和销毁Mesh组件
+            // 尝试销毁MeshFilter或SkinnedMeshRenderer组件
+            if (renderer is MeshRenderer meshRenderer)
             {
-                logger.LogDebug("禁用 GameObject: " + renderer.name);
+                var meshFilter = meshRenderer.GetComponent<MeshFilter>();
+                if (meshFilter != null)
+                {
+                    UnityEngine.Object.Destroy(meshFilter);
+                    logger.LogInfo("已销毁 MeshFilter 组件: " + renderer.name);
+                }
             }
+            else if (renderer is SkinnedMeshRenderer skinnedMeshRenderer)
+            {
+                UnityEngine.Object.Destroy(skinnedMeshRenderer);
+                logger.LogInfo("已销毁 SkinnedMeshRenderer 组件: " + renderer.name);
+            }
+
+            // 备用方案：禁用GameObject
+            renderer.gameObject.SetActive(false);
+            logger.LogInfo("已去除马赛克 (禁用GameObject模式，并尝试销毁Mesh组件): " + renderer.name);
         }
     }
 
@@ -572,6 +628,49 @@ namespace DemosaicPlugin
         public static bool Prefix()
         {
             return false;
+        }
+    }
+
+    [HarmonyPatch]
+    public static class MosaicControllerUpdatePatch
+    {
+        // 目标方法：MosaicController.Update
+        static MethodBase TargetMethod()
+        {    
+            // 此方法针对HypnoApp，RJ308908
+            // 目标方法：MosaicController.Update
+            // 使用反射获取 MosaicController 类型和 Update 方法
+            // 假设 MosaicController 在 Assembly-CSharp.dll 中
+            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "Assembly-CSharp");
+            if (assembly == null)
+            {
+                DemosaicPlugin.Logger.LogError("MosaicControllerUpdatePatch: 未找到 Assembly-CSharp 程序集，无法修补 MosaicController.Update。");
+                return null;
+            }
+
+            var mosaicControllerType = assembly.GetType("MosaicController");//马赛克类型：MosaicController
+            if (mosaicControllerType == null)
+            {
+                DemosaicPlugin.Logger.LogError("MosaicControllerUpdatePatch: 未找到 MosaicController 类型，无法修补 MosaicController.Update。");
+                return null;
+            }
+
+            var updateMethod = mosaicControllerType.GetMethod("Update", BindingFlags.Public | BindingFlags.Instance); //马赛克方法：Update 
+            if (updateMethod == null)
+            {
+                DemosaicPlugin.Logger.LogError("MosaicControllerUpdatePatch: 未找到 MosaicController.Update 方法，无法修补。");
+            }
+            else
+            {
+                DemosaicPlugin.Logger.LogInfo(string.Format("MosaicControllerUpdatePatch: 已成功找到并准备修补方法: {0}.{1}", mosaicControllerType.Name, updateMethod.Name));
+            }
+            return updateMethod;
+        }
+
+        // Prefix 方法，在原始方法执行前运行，返回 false 阻止原始方法执行
+        static bool Prefix(System.Reflection.MethodBase __originalMethod)
+        {
+            return false; // 阻止原始 Update 方法执行
         }
     }
 

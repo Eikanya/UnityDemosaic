@@ -23,7 +23,7 @@ namespace DemosaicPlugin
     // =================================================================================
     // 主插件类
     // =================================================================================
-    [BepInPlugin("demosaic", "Demosaic", "1.1.0")] 
+    [BepInPlugin("demosaic", "Demosaic", "1.2.0")] 
     public class DemosaicPlugin : BaseUnityPlugin
     {
         public static DemosaicPlugin Instance { get; private set; }
@@ -59,6 +59,25 @@ namespace DemosaicPlugin
 
             // 1. 读取配置
             LoadConfig();
+            // 尝试禁用 BepInEx 的自动保存配置功能，防止手动修改的配置文件被覆盖
+            try
+            {
+                var configFileType = typeof(ConfigEntryBase).Assembly.GetType("BepInEx.Configuration.ConfigFile");
+                var saveOnConfigChangedProperty = configFileType?.GetProperty("SaveOnConfigChanged", BindingFlags.Public | BindingFlags.Instance);
+                if (saveOnConfigChangedProperty != null && saveOnConfigChangedProperty.CanWrite)
+                {
+                    saveOnConfigChangedProperty.SetValue(Config, false);
+                    Log.LogInfo("已禁用 BepInEx 的 Config.SaveOnConfigChanged。");
+                }
+                else
+                {
+                    Log.LogWarning("未能找到或设置 BepInEx.Configuration.ConfigFile.SaveOnConfigChanged 属性。配置文件可能仍会自动保存。");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.LogError(string.Format("尝试禁用 Config.SaveOnConfigChanged 时发生错误: {0}", ex.Message));
+            }
 
             if (!_enablePlugin.Value)
             {
@@ -331,6 +350,54 @@ namespace DemosaicPlugin
     }
 
     // =================================================================================
+    // 特定方法禁用补丁模板 (Mono)
+    // =================================================================================
+    [HarmonyPatch]
+    public static class SpecificMethodPatchTemplate
+    {
+        // TODO: 修改此方法以指定您要修补的目标方法。
+        // 示例：修补 MyClass.MyMethod
+        static MethodBase TargetMethod()
+        {
+            // 替换 "MyAssembly" 为目标方法所在的程序集名称 (例如 "Assembly-CSharp")
+            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "Assembly-CSharp");
+            if (assembly == null)
+            {
+                DemosaicPlugin.Log.LogError("SpecificMethodPatchTemplate: 未找到目标程序集。");
+                return null;
+            }
+
+            // 替换 "MyNamespace.MyClass" 为目标方法所在的完整类名
+            var targetType = assembly.GetType("MosaicController");
+            if (targetType == null)
+            {
+                DemosaicPlugin.Log.LogError("SpecificMethodPatchTemplate: 未找到目标类型。");
+                return null;
+            }
+
+            // 替换 "MyMethod" 为要禁用的方法名
+            // BindingFlags 用于指定方法的可见性 (Public/NonPublic), 实例/静态 (Instance/Static)
+            var targetMethod = targetType.GetMethod("Update", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+            if (targetMethod == null)
+            {
+                DemosaicPlugin.Log.LogError("SpecificMethodPatchTemplate: 未找到目标方法。");
+            }
+            else
+            {
+                DemosaicPlugin.Log.LogInfo(string.Format("SpecificMethodPatchTemplate: 已成功找到并准备修补方法: {0}.{1}", targetType.Name, targetMethod.Name));
+            }
+            return targetMethod;
+        }
+
+        // Prefix 方法，在原始方法执行前运行，返回 false 阻止原始方法执行
+        static bool Prefix(MethodBase __originalMethod)
+        {
+            DemosaicPlugin.Log.LogWarning(string.Format("!!! Demosaic 插件已成功拦截并禁用方法: {0} !!!", __originalMethod.Name));
+            return false; // 阻止原始方法执行
+        }
+    }
+
+    // =================================================================================
     // 马赛克检测器
     // =================================================================================
     public class MosaicDetector
@@ -485,7 +552,7 @@ namespace DemosaicPlugin
         {
             if (go == null) return;
 
-            DemosaicPlugin.Log.LogInfo(string.Format("正在以模式: {0} 处理 '{1}'。", _removeMode, go.name));
+            DemosaicPlugin.Log.LogInfo(string.Format("已去除马赛克 ({0}模式): {1}", _removeMode, go.name));
 
             switch (_removeMode)
             {
