@@ -2,11 +2,15 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
-    <AssemblyName>Demosaic.mono</AssemblyName>
-    <Version>1.0.0</Version>
+    <AssemblyName>demosaic-mono</AssemblyName>
+    <Version>1.4.0</Version>
+    <RootNamespace>DemosaicPlugin</RootNamespace>
+    <LangVersion>10.0</LangVersion>
+    <NoWarn>MSB3277;CS0649;CS0169;CS8618</NoWarn>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
   </PropertyGroup>
 
-  <!-- Common Libraries -->
   <ItemGroup>
     <Reference Include="0Harmony">
       <HintPath>libs\0Harmony.dll</HintPath>
@@ -16,7 +20,7 @@
       <HintPath>libs\BepInEx.Core.dll</HintPath>
       <Private>false</Private>
     </Reference>
-     <Reference Include="BepInEx.Unity.Common">
+    <Reference Include="BepInEx.Unity.Common">
       <HintPath>libs\BepInEx.Unity.Common.dll</HintPath>
       <Private>false</Private>
     </Reference>
@@ -36,9 +40,11 @@
       <HintPath>libs\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="UnityEngine.ImageConversionModule">
+    <!-- 若未用到图像转换功能，可移除该引用，此处保留以供扩展 -->
+    <!-- <Reference Include="UnityEngine.ImageConversionModule">
       <HintPath>libs\UnityEngine.ImageConversionModule.dll</HintPath>
       <Private>false</Private>
-    </Reference>
+    </Reference> -->
   </ItemGroup>
+
 </Project>
