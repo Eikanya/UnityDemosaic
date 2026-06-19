@@ -1,8 +1,9 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
 using HarmonyLib;
+using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.Injection;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using System;
@@ -18,7 +19,8 @@ namespace DemosaicPlugin
     public enum RemoveMode
     {
         Disable,
-        Transparent
+        Transparent,
+        Smart
     }
 
     [BepInPlugin("demosaic", "Demosaic", "1.4.1")]
@@ -36,10 +38,16 @@ namespace DemosaicPlugin
         private ConfigEntry<bool> enablePlugin;
         private ConfigEntry<RemoveMode> removeMode;
         private ConfigEntry<KeyCode> forceScanHotkey;
+        private ConfigEntry<bool> includeInactiveObjects;
+        private ConfigEntry<bool> detectParentObjectNames;
+        private ConfigEntry<bool> logProcessedObjects;
         internal KeyCode ForceScanHotkeyValue => forceScanHotkey.Value;
         internal ConfigEntry<float> periodicScanInterval;
         internal ConfigEntry<float> sceneLoadScanDelay;
         internal ConfigEntry<int> scanBatchSize;
+        internal int ScanBatchSizeValue => Math.Max(1, scanBatchSize.Value);
+        internal float SceneLoadScanDelayValue => Math.Max(0f, sceneLoadScanDelay.Value);
+        internal bool IncludeInactiveObjectsValue => includeInactiveObjects.Value;
 
         private ConfigEntry<string> objectKeywords;
         private ConfigEntry<string> materialKeywords;
@@ -68,8 +76,10 @@ namespace DemosaicPlugin
         private List<string> shaderPropertyKeywordList;
         private List<string> methodDisableKeywordList;
 
-        private readonly HashSet<Renderer> processedRenderers = new HashSet<Renderer>();
+        private readonly HashSet<int> processedRendererIds = new HashSet<int>();
         private Material transparentMaterial;
+        private Shader transparentShader;
+        private bool transparentShaderIsURP;
 
         public override void Load()
         {
@@ -89,7 +99,7 @@ namespace DemosaicPlugin
             ReloadAllKeywords();
 
             CreateTransparentMaterial();
-            mosaicProcessor = new MosaicProcessor(removeMode.Value, transparentMaterial, Logger);
+            mosaicProcessor = new MosaicProcessor(removeMode.Value, transparentMaterial, Logger, logProcessedObjects.Value, materialKeywordList, shaderKeywordList, mosaicDetector);
 
             lifecycleManager = AddComponent<PluginLifecycleManager>();
             Logger.LogInfo($"Demosaic加载成功！去除方式: {removeMode.Value}");
@@ -98,6 +108,7 @@ namespace DemosaicPlugin
             {
                 harmony = new Harmony("demosaic");
                 harmony.PatchAll(typeof(DemosaicPlugin).Assembly);
+                ApplyInstantiatePatches(harmony);
                 Logger.LogInfo("Harmony 补丁应用成功，已启用实时对象拦截。");
 
                 if (disableMethods.Value)
@@ -112,19 +123,22 @@ namespace DemosaicPlugin
         private void SetupConfiguration()
         {
             enablePlugin = Config.Bind("General", "Enable", true, "是否启用去马赛克插件");
-            removeMode = Config.Bind("Remove", "Mode", RemoveMode.Disable, "去除方式：Disable=禁用GameObject，Transparent=替换为透明材质");
+            removeMode = Config.Bind("Remove", "Mode", RemoveMode.Smart, "去除方式：Disable=禁用GameObject，Transparent=替换全部材质为透明，Smart=仅替换马赛克材质槽为透明（保留同对象上的非马赛克材质）");
             forceScanHotkey = Config.Bind("General", "ForceScanHotkey", KeyCode.F10, "按下此快捷键可强制重新扫描");
             exportSceneKey = Config.Bind("General", "ExportSceneKey", KeyCode.F11, "按下此键将场景中所有渲染器信息导出到日志");
+            includeInactiveObjects = Config.Bind("General", "IncludeInactiveObjects", true, "扫描时是否包含未激活对象。Unity 2022+ 会优先使用更快的 FindObjectsByType。");
+            detectParentObjectNames = Config.Bind("General", "DetectParentObjectNames", true, "检测 Renderer 的父节点名称，适合 MosaicRoot/Quad 这类层级。");
+            logProcessedObjects = Config.Bind("General", "LogProcessedObjects", false, "是否为每个被处理对象写 Info 日志。大量对象会明显影响性能。");
 
             periodicScanInterval = Config.Bind("Scan", "PeriodicScanInterval", 10f, "定期场景扫描的间隔（秒）。设置为0可禁用。");
             sceneLoadScanDelay = Config.Bind("Scan", "SceneLoadScanDelay", 1.5f, "新场景加载后延迟扫描的时间（秒）。");
             scanBatchSize = Config.Bind("Scan", "ScanBatchSize", 500, "全场景扫描时每帧处理的对象数量，防止卡顿。");
 
-            objectKeywords = Config.Bind("Detection", "ObjectNameKeywords", "mosaic,censored,pixelated", "游戏对象名称的关键词，逗号分隔");
-            materialKeywords = Config.Bind("Detection", "MaterialNameKeywords", "mosaic,censored,pixel", "材质名称的关键词，逗号分隔");
+            objectKeywords = Config.Bind("Detection", "ObjectNameKeywords", "mosaic,censored,pixelated,mozic,mazic,mozaic", "游戏对象名称的关键词，逗号分隔");
+            materialKeywords = Config.Bind("Detection", "MaterialNameKeywords", "mosaic,censored,pixel,mozic,mazic", "材质名称的关键词，逗号分隔");
             textureKeywords = Config.Bind("Detection", "TextureKeywords", "mosaic", "纹理名称的关键词，逗号分隔");
-            shaderKeywords = Config.Bind("Detection", "ShaderNameKeywords", "mosaic,pixelate,censor,moza", "着色器名称的关键词，逗号分隔");
-            meshKeywords = Config.Bind("Detection", "MeshNameKeywords", "censor,mosaic,moza", "网格名称的关键词，逗号分隔");
+            shaderKeywords = Config.Bind("Detection", "ShaderNameKeywords", "mosaic,pixelate,censor,moza,mozic,mazic,mozaic", "着色器名称的关键词，逗号分隔");
+            meshKeywords = Config.Bind("Detection", "MeshNameKeywords", "censor,mosaic,moza,mozic,mazic,mozaic", "网格名称的关键词，逗号分隔");
             componentNameKeywords = Config.Bind("Detection", "ComponentNameKeywords", "", "组件名称的关键词，逗号分隔");
             shaderPropertyKeywords = Config.Bind("Detection", "ShaderPropertyKeywords", "_PixelSize,_BlockSize,_MosaicFactor", "着色器属性名称的关键词，逗号分隔");
             exclusionKeywords = Config.Bind("Detection", "ExclusionKeywords", "", "白名单关键词（最高优先级），逗号分隔");
@@ -151,7 +165,8 @@ namespace DemosaicPlugin
                 objectKeywordList, materialKeywordList, textureKeywordList,
                 shaderKeywordList, meshKeywordList,
                 exclusionKeywordList, componentNameKeywordList,
-                shaderPropertyKeywordList
+                shaderPropertyKeywordList,
+                detectParentObjectNames.Value
             );
 
             methodDisableKeywordList = ParseKeywordString(methodDisableKeywords.Value);
@@ -159,24 +174,72 @@ namespace DemosaicPlugin
 
         private void CreateTransparentMaterial()
         {
-            var shader = Shader.Find("Standard");
+            // 优先尝试 URP 着色器，然后回退到 HDRP，最后回退到 Standard
+            Shader shader = Shader.Find("Universal Render Pipeline/Lit");
+            transparentShaderIsURP = shader != null;
+
+            if (shader == null)
+            {
+                shader = Shader.Find("HDRP/Lit");
+                if (shader == null)
+                    shader = Shader.Find("HD Render Pipeline/Lit");
+            }
+
+            if (shader == null)
+                shader = Shader.Find("Standard");
+
             if (shader != null)
             {
-                transparentMaterial = new Material(shader);
-                transparentMaterial.SetFloat("_Mode", 3);
-                transparentMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-                transparentMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-                transparentMaterial.SetInt("_ZWrite", 0);
-                transparentMaterial.DisableKeyword("_ALPHATEST_ON");
-                transparentMaterial.EnableKeyword("_ALPHABLEND_ON");
-                transparentMaterial.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-                transparentMaterial.renderQueue = 3000;
-                transparentMaterial.color = Color.clear;
+                transparentShader = shader;
+                transparentMaterial = CreateTransparentMaterialFromShader(shader, transparentShaderIsURP);
+                Logger.LogInfo($"透明材质创建成功，使用着色器: {shader.name}");
             }
             else
             {
-                Logger.LogError("未能找到 Standard 着色器。透明模式将无法正常工作。");
+                Logger.LogError("未能找到 URP Lit、HDRP Lit 或 Standard 着色器。透明模式将无法正常工作。");
             }
+        }
+
+        private Material CreateTransparentMaterialFromShader(Shader shader, bool isURP)
+        {
+            var mat = new Material(shader);
+            // 防止 Unity GC 回收
+            mat.hideFlags = HideFlags.HideAndDontSave;
+            if (isURP)
+            {
+                mat.SetFloat("_Surface", 1);
+                mat.SetFloat("_Blend", 0);
+                mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                mat.SetInt("_ZWrite", 0);
+                mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+            }
+            else
+            {
+                mat.SetFloat("_Mode", 3);
+                mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                mat.SetInt("_ZWrite", 0);
+                mat.DisableKeyword("_ALPHATEST_ON");
+                mat.EnableKeyword("_ALPHABLEND_ON");
+                mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+            }
+            mat.renderQueue = 3000;
+            mat.color = Color.clear;
+            return mat;
+        }
+
+        /// <summary>
+        /// 确保透明材质可用。如果材质被 GC 回收则自动重建。
+        /// </summary>
+        internal Material EnsureTransparentMaterial()
+        {
+            if (transparentMaterial == null && transparentShader != null)
+            {
+                transparentMaterial = CreateTransparentMaterialFromShader(transparentShader, transparentShaderIsURP);
+                Logger.LogWarning("透明材质被回收，已自动重建。");
+            }
+            return transparentMaterial;
         }
 
         private List<string> ParseKeywordString(string keywordString)
@@ -189,18 +252,28 @@ namespace DemosaicPlugin
 
         internal void NotifySceneUnloaded()
         {
-            processedRenderers.Clear();
+            processedRendererIds.Clear();
             mosaicDetector.ClearCache();
+        }
+
+        internal void RequestFullScan()
+        {
+            processedRendererIds.Clear();
+            mosaicDetector.ClearCache();
+            lifecycleManager?.RestartBatchScan();
         }
 
         internal bool ProcessRenderer(Renderer renderer)
         {
-            if (renderer == null || !renderer.enabled || processedRenderers.Contains(renderer)) return false;
+            if (renderer == null) return false;
+
+            int rendererId = renderer.GetInstanceID();
+            if (processedRendererIds.Contains(rendererId)) return false;
 
             if (mosaicDetector.IsMosaic(renderer))
             {
                 mosaicProcessor.Process(renderer);
-                processedRenderers.Add(renderer);
+                processedRendererIds.Add(rendererId);
                 return true;
             }
             return false;
@@ -208,7 +281,11 @@ namespace DemosaicPlugin
 
         public void ProcessNewGameObject(GameObject go)
         {
-            if (go == null || !go.activeInHierarchy) return;
+            if (go == null) return;
+
+            // 快速检查以避免对没有渲染器的GameObject层级分配数组
+            var hasRenderer = go.GetComponentInChildren<Renderer>(true);
+            if (hasRenderer == null) return;
 
             var renderers = go.GetComponentsInChildren<Renderer>(true);
             foreach (var renderer in renderers)
@@ -222,12 +299,71 @@ namespace DemosaicPlugin
             if (e.ChangedSetting.Definition.Key.Contains("Keywords"))
             {
                 ReloadAllKeywords();
-                mosaicDetector.ClearCache();
+                // Smart 模式下关键词变更也需要重建处理器
+                if (removeMode.Value == RemoveMode.Smart)
+                    mosaicProcessor = new MosaicProcessor(removeMode.Value, transparentMaterial, Logger, logProcessedObjects.Value, materialKeywordList, shaderKeywordList, mosaicDetector);
+                RequestFullScan();
             }
             else if (e.ChangedSetting.Definition.Key == removeMode.Definition.Key)
             {
-                mosaicProcessor = new MosaicProcessor(removeMode.Value, transparentMaterial, Logger);
+                mosaicProcessor = new MosaicProcessor(removeMode.Value, transparentMaterial, Logger, logProcessedObjects.Value, materialKeywordList, shaderKeywordList, mosaicDetector);
+                RequestFullScan();
                 Logger.LogInfo($"处理模式已更新为: {removeMode.Value}。");
+            }
+            else if (e.ChangedSetting.Definition.Key == logProcessedObjects.Definition.Key)
+            {
+                mosaicProcessor = new MosaicProcessor(removeMode.Value, transparentMaterial, Logger, logProcessedObjects.Value, materialKeywordList, shaderKeywordList, mosaicDetector);
+            }
+        }
+
+        private void ApplyInstantiatePatches(Harmony harmonyInstance)
+        {
+            var postfix = new HarmonyMethod(typeof(DemosaicPlugin), nameof(InstantiatePatch));
+            foreach (var method in AccessTools.GetDeclaredMethods(typeof(UnityEngine.Object))
+                .Where(method => method.Name == nameof(UnityEngine.Object.Instantiate) &&
+                                 !method.IsGenericMethodDefinition &&
+                                 !method.ContainsGenericParameters))
+            {
+                try
+                {
+                    harmonyInstance.Patch(method, postfix: postfix);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug($"跳过 Instantiate 重载补丁 {method}: {ex.Message}");
+                }
+            }
+        }
+
+        private static void InstantiatePatch(UnityEngine.Object __result)
+        {
+            if (Instance == null) return;
+            try
+            {
+                if (__result != null)
+                {
+                    var go = __result.TryCast<GameObject>();
+                    if (go != null)
+                    {
+                        Instance.ProcessNewGameObject(go);
+                    }
+                    else
+                    {
+                        var comp = __result.TryCast<Component>();
+                        if (comp != null)
+                        {
+                            var compGo = comp.gameObject;
+                            if (compGo != null)
+                            {
+                                Instance.ProcessNewGameObject(compGo);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"处理实例化对象错误: {ex}");
             }
         }
 
@@ -256,7 +392,11 @@ namespace DemosaicPlugin
                         foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
                                                                BindingFlags.Instance | BindingFlags.Static))
                         {
-                            if (method.IsSpecialName || method.IsGenericMethod || method.IsAbstract) continue;
+                            if (method.IsSpecialName || method.IsGenericMethod || method.ContainsGenericParameters ||
+                                method.IsAbstract || method.ReturnType != typeof(void))
+                            {
+                                continue;
+                            }
 
                             if (methodDisableKeywordList.Any(keyword =>
                                     method.Name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0))
@@ -288,6 +428,7 @@ namespace DemosaicPlugin
             if (transparentMaterial != null)
                 UnityEngine.Object.Destroy(transparentMaterial);
 
+            Instance = null;
             Logger.LogInfo("Demosaic 插件已卸载。");
             return base.Unload();
         }
@@ -306,11 +447,13 @@ namespace DemosaicPlugin
         private List<string> exclusionKeywordList;
         private List<string> componentNameKeywordList;
         private List<string> shaderPropertyKeywordList;
+        private bool detectParentObjectNames;
         private readonly ManualLogSource logger;
 
         private Dictionary<int, bool> materialCache = new Dictionary<int, bool>();
         private Dictionary<int, bool> shaderCache = new Dictionary<int, bool>();
         private Dictionary<string, bool> componentTypeCache = new Dictionary<string, bool>();
+        private Dictionary<int, bool?> parentHierarchyCache = new Dictionary<int, bool?>();
 
         public MosaicDetector(ManualLogSource logger)
         {
@@ -321,7 +464,8 @@ namespace DemosaicPlugin
             List<string> objKeywords, List<string> matKeywords, List<string> texKeywords,
             List<string> shadKeywords, List<string> mshKeywords,
             List<string> exclKeywords, List<string> compKeywords,
-            List<string> shadPropKeywords)
+            List<string> shadPropKeywords,
+            bool detectParentObjectNames)
         {
             objectKeywordList = objKeywords;
             materialKeywordList = matKeywords;
@@ -331,6 +475,35 @@ namespace DemosaicPlugin
             exclusionKeywordList = exclKeywords;
             componentNameKeywordList = compKeywords;
             shaderPropertyKeywordList = shadPropKeywords;
+            this.detectParentObjectNames = detectParentObjectNames;
+        }
+
+        public bool IsMaterialCached(Material mat, out bool isMosaic)
+        {
+            isMosaic = false;
+            if (mat == null) return false;
+            return materialCache.TryGetValue(mat.GetInstanceID(), out isMosaic);
+        }
+
+        public bool IsObjectNameOrParentMosaic(GameObject go)
+        {
+            if (go == null) return false;
+            string goName = go.name;
+            if (NameContainsKeyword(goName, exclusionKeywordList)) return false;
+            if (NameContainsKeyword(goName, objectKeywordList)) return true;
+
+            if (detectParentObjectNames)
+            {
+                var parent = go.transform.parent;
+                while (parent != null)
+                {
+                    string parentName = parent.name;
+                    if (NameContainsKeyword(parentName, exclusionKeywordList)) return false;
+                    if (NameContainsKeyword(parentName, objectKeywordList)) return true;
+                    parent = parent.parent;
+                }
+            }
+            return false;
         }
 
         public void ClearCache()
@@ -338,14 +511,59 @@ namespace DemosaicPlugin
             materialCache.Clear();
             shaderCache.Clear();
             componentTypeCache.Clear();
+            parentHierarchyCache.Clear();
         }
 
         public bool IsMosaic(Renderer renderer)
         {
             var go = renderer.gameObject;
+            string goName = go.name;
 
-            if (NameContainsKeyword(go.name, exclusionKeywordList)) return false;
-            if (CheckAndLog(go.name, objectKeywordList, "对象名检测")) return true;
+            if (NameContainsKeyword(goName, exclusionKeywordList)) return false;
+            if (CheckAndLog(goName, objectKeywordList, "对象名检测")) return true;
+
+            if (detectParentObjectNames)
+            {
+                var parent = go.transform.parent;
+                if (parent != null)
+                {
+                    int parentId = parent.GetInstanceID();
+                    if (parentHierarchyCache.TryGetValue(parentId, out bool? cachedResult))
+                    {
+                        if (cachedResult.HasValue)
+                        {
+                            if (cachedResult.Value) return true;
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        bool? result = null;
+                        var current = parent;
+                        while (current != null)
+                        {
+                            string currentName = current.name;
+                            if (NameContainsKeyword(currentName, exclusionKeywordList))
+                            {
+                                result = false;
+                                break;
+                            }
+                            if (CheckAndLog(currentName, objectKeywordList, "父对象名检测"))
+                            {
+                                result = true;
+                                break;
+                            }
+                            current = current.parent;
+                        }
+                        parentHierarchyCache[parentId] = result;
+                        if (result.HasValue)
+                        {
+                            if (result.Value) return true;
+                            return false;
+                        }
+                    }
+                }
+            }
 
             foreach (var mat in renderer.sharedMaterials)
             {
@@ -363,10 +581,24 @@ namespace DemosaicPlugin
                 if (isCurrentMatMosaic) return true;
             }
 
-            Mesh mesh = (renderer is SkinnedMeshRenderer smr)
-                ? smr.sharedMesh
-                : (renderer.GetComponent<MeshFilter>()?.sharedMesh);
-            if (mesh != null && CheckAndLog(mesh.name, meshKeywordList, "网格名检测")) return true;
+            if (meshKeywordList != null && meshKeywordList.Count > 0)
+            {
+                Mesh mesh = null;
+                var smr = renderer.TryCast<SkinnedMeshRenderer>();
+                if (smr != null)
+                {
+                    mesh = smr.sharedMesh;
+                }
+                else
+                {
+                    var mf = renderer.GetComponent<MeshFilter>();
+                    if (mf != null)
+                    {
+                        mesh = mf.sharedMesh;
+                    }
+                }
+                if (mesh != null && CheckAndLog(mesh.name, meshKeywordList, "网格名检测")) return true;
+            }
 
             if (CheckComponents(go)) return true;
 
@@ -462,28 +694,64 @@ namespace DemosaicPlugin
     public class MosaicProcessor
     {
         private readonly RemoveMode removeMode;
-        private readonly Material transparentMaterial;
         private readonly ManualLogSource logger;
+        private readonly bool logProcessedObjects;
+        private readonly List<string> materialKeywords;
+        private readonly List<string> shaderKeywords;
+        private readonly MosaicDetector detector;
+        private readonly Dictionary<int, Il2CppReferenceArray<Material>> transparentMaterialArrays = new Dictionary<int, Il2CppReferenceArray<Material>>();
 
-        public MosaicProcessor(RemoveMode removeMode, Material transparentMaterial, ManualLogSource logger)
+        public MosaicProcessor(RemoveMode removeMode, Material transparentMaterial, ManualLogSource logger, bool logProcessedObjects,
+            List<string> materialKeywords = null, List<string> shaderKeywords = null, MosaicDetector detector = null)
         {
             this.removeMode = removeMode;
-            this.transparentMaterial = transparentMaterial;
             this.logger = logger;
+            this.logProcessedObjects = logProcessedObjects;
+            this.materialKeywords = materialKeywords;
+            this.shaderKeywords = shaderKeywords;
+            this.detector = detector;
+        }
+
+        private Material GetTransparentMaterial()
+        {
+            // 动态获取，支持自动重建被 GC 回收的材质
+            if (DemosaicPlugin.Instance != null)
+                return DemosaicPlugin.Instance.EnsureTransparentMaterial();
+            return null;
         }
 
         public void Process(Renderer renderer)
         {
-            if (removeMode == RemoveMode.Transparent)
+            var transMat = GetTransparentMaterial();
+
+            // 禁用阴影，防止透明面片投射黑影块导致阴影区变色/暗色斑块
+            try
             {
-                if (transparentMaterial != null)
+                renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                renderer.receiveShadows = false;
+            }
+            catch { }
+
+            if (removeMode == RemoveMode.Smart)
+            {
+                if (transMat != null)
+                {
+                    ProcessSmart(renderer, transMat);
+                    return;
+                }
+                else
+                {
+                    logger.LogWarning($"透明材质缺失，Smart 模式降级为 Disable: {renderer.name}");
+                }
+            }
+            else if (removeMode == RemoveMode.Transparent)
+            {
+                if (transMat != null)
                 {
                     var sharedMats = renderer.sharedMaterials;
-                    var newMaterials = new Il2CppReferenceArray<Material>(sharedMats.Length);
-                    for (int i = 0; i < newMaterials.Length; i++)
-                        newMaterials[i] = transparentMaterial;
-                    renderer.sharedMaterials = newMaterials;
-                    logger.LogInfo($"已去除马赛克 (透明模式): {renderer.name}");
+                    renderer.sharedMaterials = GetTransparentMaterialArray(sharedMats.Length, transMat);
+                    if (logProcessedObjects)
+                        logger.LogInfo($"已去除马赛克 (透明模式): {renderer.name}");
                     return;
                 }
                 else
@@ -493,7 +761,260 @@ namespace DemosaicPlugin
             }
 
             renderer.gameObject.SetActive(false);
-            logger.LogInfo($"已去除马赛克 (禁用模式): {renderer.name}");
+            if (logProcessedObjects)
+                logger.LogInfo($"已去除马赛克 (禁用模式): {renderer.name}");
+        }
+
+        private void ProcessSmart(Renderer renderer, Material transMat)
+        {
+            var sharedMats = renderer.sharedMaterials;
+            bool hasMosaicMat = false;
+
+            for (int i = 0; i < sharedMats.Length; i++)
+            {
+                if (IsMosaicMaterial(sharedMats[i]))
+                {
+                    hasMosaicMat = true;
+                    break;
+                }
+            }
+
+            if (hasMosaicMat)
+            {
+                for (int i = 0; i < sharedMats.Length; i++)
+                {
+                    if (IsMosaicMaterial(sharedMats[i]))
+                        sharedMats[i] = transMat;
+                }
+                renderer.sharedMaterials = sharedMats;
+                if (logProcessedObjects)
+                    logger.LogInfo($"已去除马赛克 (智能模式 - 仅替换马赛克材质槽): {renderer.name}");
+            }
+            else
+            {
+                // 只有当 GameObject 名字或父节点名字命中关键词时，才回退为全透明，防止网格名命中误伤整体皮肤
+                if (detector != null && detector.IsObjectNameOrParentMosaic(renderer.gameObject))
+                {
+                    renderer.sharedMaterials = GetTransparentMaterialArray(sharedMats.Length, transMat);
+                    if (logProcessedObjects)
+                        logger.LogInfo($"已去除马赛克 (智能模式 - 全透明回退): {renderer.name}");
+                }
+                else
+                {
+                    if (logProcessedObjects)
+                        logger.LogWarning($"跳过智能模式全透明回退以避免假阳性: {renderer.name} (仅网格名或组件名命中)");
+                }
+            }
+        }
+
+        private bool IsMosaicMaterial(Material mat)
+        {
+            if (mat == null) return false;
+
+            // 优先从共享材质缓存查询
+            if (detector != null && detector.IsMaterialCached(mat, out bool isMosaic))
+            {
+                return isMosaic;
+            }
+
+            if (materialKeywords != null)
+            {
+                for (int i = 0; i < materialKeywords.Count; i++)
+                {
+                    if (mat.name.IndexOf(materialKeywords[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+
+            if (shaderKeywords != null && mat.shader != null)
+            {
+                string shaderName = mat.shader.name;
+                for (int i = 0; i < shaderKeywords.Count; i++)
+                {
+                    if (shaderName.IndexOf(shaderKeywords[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private Il2CppReferenceArray<Material> GetTransparentMaterialArray(int materialCount, Material transMat)
+        {
+            if (!transparentMaterialArrays.TryGetValue(materialCount, out var materials))
+            {
+                materials = new Il2CppReferenceArray<Material>(materialCount);
+                for (int i = 0; i < materials.Length; i++)
+                    materials[i] = transMat;
+                transparentMaterialArrays[materialCount] = materials;
+            }
+            return materials;
+        }
+    }
+
+    // =================================================================================
+    // 安全输入管理器（兼容新旧 Input System）
+    // =================================================================================
+    internal static class SafeInput
+    {
+        private static bool _legacyInputAvailable = true;
+        private static bool _warned = false;
+        private static System.Reflection.MethodInfo _keyboardCurrentMethod;
+        private static System.Reflection.MethodInfo _keyIsPressedMethod;
+        private static object _keyboardInstance;
+        private static bool _newInputInitialized = false;
+        private static readonly Dictionary<KeyCode, object[]> _keyArgsCache = new Dictionary<KeyCode, object[]>();
+
+        /// <summary>
+        /// 安全检测按键按下，兼容旧版 Input 和新版 Input System。
+        /// </summary>
+        public static bool GetKeyDown(KeyCode key)
+        {
+            // 优先尝试旧版 Input
+            if (_legacyInputAvailable)
+            {
+                try
+                {
+                    return Input.GetKeyDown(key);
+                }
+                catch (Exception ex)
+                {
+                    // IL2CPP 环境下异常被 Il2CppException 包装，无法直接 catch InvalidOperationException
+                    // 通过消息判断是否为 Input System 冲突
+                    if (ex.Message.Contains("Input System") || ex.InnerException?.Message.Contains("Input System") == true)
+                    {
+                        _legacyInputAvailable = false;
+                        if (!_warned)
+                        {
+                            DemosaicPlugin.Logger.LogWarning("检测到游戏使用新版 Input System，旧版 Input 已禁用。尝试初始化新输入系统支持...");
+                            _warned = true;
+                        }
+                    }
+                    else
+                    {
+                        // 其他异常直接抛出
+                        throw;
+                    }
+                }
+            }
+
+            // 降级到新版 Input System（通过反射）
+            return TryNewInputSystemKeyDown(key);
+        }
+
+        private static object[] GetKeyArgs(KeyCode key)
+        {
+            if (!_keyArgsCache.TryGetValue(key, out var args))
+            {
+                var keyEnum = MapKeyCodeToKey(key);
+                if (keyEnum != null)
+                {
+                    args = new object[] { keyEnum };
+                    _keyArgsCache[key] = args;
+                }
+            }
+            return args;
+        }
+
+        private static bool TryNewInputSystemKeyDown(KeyCode key)
+        {
+            try
+            {
+                if (!_newInputInitialized)
+                {
+                    InitializeNewInputSystem();
+                    _newInputInitialized = true;
+                }
+
+                if (_keyboardCurrentMethod == null || _keyIsPressedMethod == null) return false;
+
+                if (_keyboardInstance == null)
+                {
+                    _keyboardInstance = _keyboardCurrentMethod.Invoke(null, null);
+                    if (_keyboardInstance == null) return false;
+                }
+
+                var args = GetKeyArgs(key);
+                if (args == null) return false;
+
+                var result = _keyIsPressedMethod.Invoke(_keyboardInstance, args);
+                return result is bool b && b;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void InitializeNewInputSystem()
+        {
+            try
+            {
+                // 查找 UnityEngine.InputSystem.Keyboard 类型
+                Type keyboardType = null;
+                Type keyEnumType = null;
+
+                // 优先通过 Il2CppInterop 查找（IL2CPP 环境下 InputSystem 是 Il2Cpp 类型）
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    var asmName = asm.GetName().Name;
+                    if (asmName.Contains("InputSystem") || asmName.Contains("Unity.InputSystem"))
+                    {
+                        if (keyboardType == null) keyboardType = asm.GetType("UnityEngine.InputSystem.Keyboard");
+                        if (keyEnumType == null) keyEnumType = asm.GetType("UnityEngine.InputSystem.Key");
+                    }
+                }
+
+                // 备用：Type.GetType
+                if (keyboardType == null)
+                    keyboardType = Type.GetType("UnityEngine.InputSystem.Keyboard, Unity.InputSystem");
+                if (keyEnumType == null)
+                    keyEnumType = Type.GetType("UnityEngine.InputSystem.Key, Unity.InputSystem");
+
+                if (keyboardType == null)
+                {
+                    DemosaicPlugin.Logger.LogWarning("未能找到 InputSystem.Keyboard 类型，快捷键功能将不可用。");
+                    return;
+                }
+
+                _keyboardCurrentMethod = keyboardType.GetProperty("current", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetMethod;
+
+                // Keyboard 的 IsKeyPressed(Key) 方法
+                if (keyEnumType != null)
+                {
+                    _keyIsPressedMethod = keyboardType.GetMethod("IsKeyPressed", new[] { keyEnumType });
+                    if (_keyIsPressedMethod == null)
+                    {
+                        // 尝试 wasKeyPressedThisFrame（部分版本方法名不同）
+                        _keyIsPressedMethod = keyboardType.GetMethod("wasKeyPressedThisFrame", new[] { keyEnumType });
+                    }
+                }
+
+                if (_keyboardCurrentMethod != null && _keyIsPressedMethod != null)
+                    DemosaicPlugin.Logger.LogInfo("新版 Input System 键盘支持初始化成功。");
+                else
+                    DemosaicPlugin.Logger.LogWarning($"Input System Keyboard 方法未找到 (current={_keyboardCurrentMethod != null}, isPressed={_keyIsPressedMethod != null})，快捷键不可用。");
+            }
+            catch (Exception ex)
+            {
+                DemosaicPlugin.Logger.LogWarning($"初始化新版 Input System 失败: {ex.Message}。快捷键功能将不可用。");
+            }
+        }
+
+        private static object MapKeyCodeToKey(KeyCode keyCode)
+        {
+            // InputSystem.Key 枚举值名称与 KeyCode 大部分一致
+            string keyName = keyCode.ToString();
+            try
+            {
+                var keyEnumType = _keyIsPressedMethod?.GetParameters()[0].ParameterType;
+                if (keyEnumType == null) return null;
+                return Enum.Parse(keyEnumType, keyName, ignoreCase: true);
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 
@@ -542,7 +1063,7 @@ namespace DemosaicPlugin
             if (_delayScanQueued)
             {
                 _delayScanTimer += Time.deltaTime;
-                if (_delayScanTimer >= DemosaicPlugin.Instance.sceneLoadScanDelay.Value)
+                if (_delayScanTimer >= DemosaicPlugin.Instance.SceneLoadScanDelayValue)
                 {
                     _delayScanQueued = false;
                     StartBatchScan();
@@ -562,15 +1083,14 @@ namespace DemosaicPlugin
             }
 
             // 3. 手动扫描热键
-            if (Input.GetKeyDown(DemosaicPlugin.Instance.ForceScanHotkeyValue))
+            if (SafeInput.GetKeyDown(DemosaicPlugin.Instance.ForceScanHotkeyValue))
             {
                 DemosaicPlugin.Logger.LogInfo("快捷键被按下，强制重新执行全场景扫描...");
-                DemosaicPlugin.Instance.NotifySceneUnloaded();
-                StartBatchScan();
+                DemosaicPlugin.Instance.RequestFullScan();
             }
 
             // 4. 新增：导出场景资源热键
-            if (Input.GetKeyDown(DemosaicPlugin.Instance.exportSceneKey.Value))
+            if (SafeInput.GetKeyDown(DemosaicPlugin.Instance.exportSceneKey.Value))
             {
                 DemosaicPlugin.Logger.LogInfo("开始将场景渲染器信息导出到日志...");
                 StartExport();
@@ -602,10 +1122,17 @@ namespace DemosaicPlugin
         private void StartBatchScan()
         {
             if (_isBatchScanning) return;
-            _batchRenderers = UnityEngine.Object.FindObjectsOfType<Renderer>();
+            _batchRenderers = SceneObjectFinder.FindRenderers(DemosaicPlugin.Instance.IncludeInactiveObjectsValue);
             _currentBatchIndex = 0;
             _isBatchScanning = true;
             DemosaicPlugin.Logger.LogDebug($"开始分批扫描 {_batchRenderers.Length} 个渲染器...");
+        }
+
+        internal void RestartBatchScan()
+        {
+            _isBatchScanning = false;
+            _batchRenderers = null;
+            StartBatchScan();
         }
 
         private void ProcessBatchScan()
@@ -613,7 +1140,7 @@ namespace DemosaicPlugin
             var renderers = _batchRenderers;
             if (!_isBatchScanning || renderers == null) return;
 
-            int batchSize = DemosaicPlugin.Instance.scanBatchSize.Value;
+            int batchSize = DemosaicPlugin.Instance.ScanBatchSizeValue;
             int processed = 0;
             while (_currentBatchIndex < renderers.Length && processed < batchSize)
             {
@@ -634,7 +1161,7 @@ namespace DemosaicPlugin
         private void StartExport()
         {
             if (_isExporting) return;
-            _exportRenderers = UnityEngine.Object.FindObjectsOfType<Renderer>();
+            _exportRenderers = SceneObjectFinder.FindRenderers(false);
             _exportCurrentIndex = 0;
             _isExporting = true;
             DemosaicPlugin.Logger.LogInfo($"准备导出 {_exportRenderers.Length} 个渲染器信息...");
@@ -645,7 +1172,7 @@ namespace DemosaicPlugin
             var renderers = _exportRenderers;
             if (!_isExporting || renderers == null) return;
 
-            int batchSize = DemosaicPlugin.Instance.scanBatchSize.Value;
+            int batchSize = DemosaicPlugin.Instance.ScanBatchSizeValue;
             int processed = 0;
 
             while (_exportCurrentIndex < renderers.Length && processed < batchSize)
@@ -655,23 +1182,36 @@ namespace DemosaicPlugin
                 {
                     var go = renderer.gameObject;
                     string meshName = "N/A";
-                    if (renderer is SkinnedMeshRenderer smr && smr.sharedMesh != null)
-                        meshName = smr.sharedMesh.name;
-                    else if (renderer is MeshRenderer)
+
+                    var smr = renderer.TryCast<SkinnedMeshRenderer>();
+                    if (smr != null && smr.sharedMesh != null)
                     {
-                        var mf = renderer.GetComponent<MeshFilter>();
-                        if (mf != null && mf.sharedMesh != null)
-                            meshName = mf.sharedMesh.name;
+                        meshName = smr.sharedMesh.name;
+                    }
+                    else
+                    {
+                        var mr = renderer.TryCast<MeshRenderer>();
+                        if (mr != null)
+                        {
+                            var mf = renderer.GetComponent<MeshFilter>();
+                            if (mf != null && mf.sharedMesh != null)
+                            {
+                                meshName = mf.sharedMesh.name;
+                            }
+                        }
                     }
 
+                    string goName = go.name;
                     var mats = renderer.sharedMaterials;
                     for (int i = 0; i < mats.Length; i++)
                     {
                         var mat = mats[i];
                         if (mat != null)
                         {
+                            string matName = mat.name;
+                            string shaderName = (mat.shader != null) ? mat.shader.name : "N/A";
                             DemosaicPlugin.Logger.LogInfo(
-                                $"[Demosaic Export] GO: {go.name} | Material: {mat.name} | Shader: {(mat.shader != null ? mat.shader.name : "N/A")} | Mesh: {meshName}");
+                                $"[Demosaic Export] GO: {goName} | Material: {matName} | Shader: {shaderName} | Mesh: {meshName}");
                         }
                     }
                 }
@@ -688,6 +1228,62 @@ namespace DemosaicPlugin
         }
     }
 
+    internal static class SceneObjectFinder
+    {
+        private static MethodInfo findObjectsByTypeMethod;
+        private static object includeInactive;
+        private static object excludeInactive;
+        private static object sortNone;
+        private static bool initialized;
+
+        public static Il2CppArrayBase<Renderer> FindRenderers(bool includeInactiveObjects)
+        {
+            Initialize();
+            if (findObjectsByTypeMethod != null)
+            {
+                try
+                {
+                    var result = findObjectsByTypeMethod.Invoke(null, new[] { includeInactiveObjects ? includeInactive : excludeInactive, sortNone });
+                    if (result is Il2CppArrayBase<Renderer> renderers)
+                        return renderers;
+                }
+                catch
+                {
+                    findObjectsByTypeMethod = null;
+                }
+            }
+
+            return UnityEngine.Object.FindObjectsOfType<Renderer>();
+        }
+
+        private static void Initialize()
+        {
+            if (initialized) return;
+            initialized = true;
+
+            var objectType = typeof(UnityEngine.Object);
+            var inactiveType = objectType.Assembly.GetType("UnityEngine.FindObjectsInactive");
+            var sortModeType = objectType.Assembly.GetType("UnityEngine.FindObjectsSortMode");
+            if (inactiveType == null || sortModeType == null) return;
+
+            includeInactive = Enum.Parse(inactiveType, "Include");
+            excludeInactive = Enum.Parse(inactiveType, "Exclude");
+            sortNone = Enum.Parse(sortModeType, "None");
+
+            findObjectsByTypeMethod = objectType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .Where(method => method.Name == "FindObjectsByType" &&
+                                 method.IsGenericMethodDefinition &&
+                                 method.GetParameters().Length == 2)
+                .Select(method => method.MakeGenericMethod(typeof(Renderer)))
+                .FirstOrDefault(method =>
+                {
+                    var parameters = method.GetParameters();
+                    return parameters[0].ParameterType == inactiveType &&
+                           parameters[1].ParameterType == sortModeType;
+                });
+        }
+    }
+
     // =================================================================================
     // Harmony 实时拦截补丁
     // =================================================================================
@@ -699,17 +1295,6 @@ namespace DemosaicPlugin
             if (!value || DemosaicPlugin.Instance == null) return;
             try { DemosaicPlugin.Instance.ProcessNewGameObject(__instance); }
             catch (Exception ex) { DemosaicPlugin.Logger.LogError($"处理新GameObject '{__instance.name}' 错误: {ex}"); }
-        }
-    }
-
-    [HarmonyPatch(typeof(UnityEngine.Object), nameof(UnityEngine.Object.Instantiate), new Type[] { typeof(UnityEngine.Object) })]
-    class Object_Instantiate_Patch
-    {
-        static void Postfix(UnityEngine.Object __result)
-        {
-            if (DemosaicPlugin.Instance == null) return;
-            try { if (__result is GameObject go) DemosaicPlugin.Instance.ProcessNewGameObject(go); }
-            catch (Exception ex) { DemosaicPlugin.Logger.LogError($"处理实例化对象错误: {ex}"); }
         }
     }
 
