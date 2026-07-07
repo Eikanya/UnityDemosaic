@@ -172,36 +172,53 @@ namespace DemosaicPlugin
             methodDisableKeywordList = ParseKeywordString(methodDisableKeywords.Value);
         }
 
-        private void CreateTransparentMaterial()
+    private void CreateTransparentMaterial()
+    {
+        string[] shaderNames =
         {
-            // 优先尝试 URP 着色器，然后回退到 HDRP，最后回退到 Standard
-            Shader shader = Shader.Find("Universal Render Pipeline/Lit");
-            transparentShaderIsURP = shader != null;
+            "Sprites/Default",
+            "UI/Default",
+            "Unlit/Transparent",
+            "Spine/Skeleton",
+            "Universal Render Pipeline/Lit",
+            "HDRP/Lit",
+            "HD Render Pipeline/Lit",
+            "Standard"
+        };
 
-            if (shader == null)
-            {
-                shader = Shader.Find("HDRP/Lit");
-                if (shader == null)
-                    shader = Shader.Find("HD Render Pipeline/Lit");
-            }
+        Shader shader = null;
 
-            if (shader == null)
-                shader = Shader.Find("Standard");
-
+        foreach (var name in shaderNames)
+        {
+            shader = Shader.Find(name);
             if (shader != null)
             {
-                transparentShader = shader;
-                transparentMaterial = CreateTransparentMaterialFromShader(shader, transparentShaderIsURP);
-                Logger.LogInfo($"透明材质创建成功，使用着色器: {shader.name}");
-            }
-            else
-            {
-                Logger.LogError("未能找到 URP Lit、HDRP Lit 或 Standard 着色器。透明模式将无法正常工作。");
+                Logger.LogInfo($"找到透明Shader: {shader.name}");
+                break;
             }
         }
 
+        if (shader == null)
+        {
+            Logger.LogError("无法找到任何可用Shader。");
+            return;
+        }
+
+        transparentShader = shader;
+        transparentShaderIsURP = shader.name.Contains("Universal");
+
+        transparentMaterial = CreateTransparentMaterialFromShader(shader, transparentShaderIsURP);
+    }
+
         private Material CreateTransparentMaterialFromShader(Shader shader, bool isURP)
         {
+            if (shader.name == "Sprites/Default")
+            {
+                var mat1 = new Material(shader);
+                mat1.hideFlags = HideFlags.HideAndDontSave;
+                mat1.color = new Color(1f,1f,1f,0f);
+                return mat1;
+            }
             var mat = new Material(shader);
             // 防止 Unity GC 回收
             mat.hideFlags = HideFlags.HideAndDontSave;
