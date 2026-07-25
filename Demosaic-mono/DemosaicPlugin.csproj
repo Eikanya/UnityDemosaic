@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <AssemblyName>demosaic-mono</AssemblyName>
-    <Version>1.4.0</Version>
+    <Version>1.5.0</Version>
     <RootNamespace>DemosaicPlugin</RootNamespace>
     <LangVersion>10.0</LangVersion>
     <NoWarn>MSB3277;CS0649;CS0169;CS8618</NoWarn>

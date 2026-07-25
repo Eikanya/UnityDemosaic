@@ -23,7 +23,7 @@ namespace DemosaicPlugin
         Smart
     }
 
-    [BepInPlugin("demosaic", "Demosaic", "1.4.1")]
+    [BepInPlugin("demosaic", "Demosaic", "1.5.0")]
     public class DemosaicPlugin : BasePlugin
     {
         public static DemosaicPlugin Instance { get; private set; }
@@ -60,7 +60,18 @@ namespace DemosaicPlugin
 
         private ConfigEntry<bool> disableMethods;
         private ConfigEntry<string> methodDisableKeywords;
+        private ConfigEntry<string> methodExcludeKeywords;
         private ConfigEntry<string> methodPatchTargetAssemblies;
+
+        // Camera 后处理检测
+        private ConfigEntry<bool> enableCameraEffectDetection;
+        private ConfigEntry<string> cameraEffectKeywords;
+
+        // Decal/Projector 检测
+        private ConfigEntry<bool> enableDecalDetection;
+
+        // 材质 setter Hook
+        private ConfigEntry<bool> enableMaterialSetterHook;
 
         // 新增：导出场景键
         internal ConfigEntry<KeyCode> exportSceneKey;
@@ -75,8 +86,15 @@ namespace DemosaicPlugin
         private List<string> componentNameKeywordList;
         private List<string> shaderPropertyKeywordList;
         private List<string> methodDisableKeywordList;
+        private List<string> methodExcludeKeywordList;
+        private List<string> cameraEffectKeywordList;
 
         private readonly HashSet<int> processedRendererIds = new HashSet<int>();
+        private readonly HashSet<int> processedCameraEffectIds = new HashSet<int>();
+        private readonly HashSet<int> processedDecalIds = new HashSet<int>();
+        private static bool _isProcessingMaterial = false; // 防止材质 setter hook 递归
+        private static int _lastMaterialHookFrame = -1;
+        private static readonly HashSet<int> _materialHookFrameDedup = new HashSet<int>();
         private Material transparentMaterial;
         private Shader transparentShader;
         private bool transparentShaderIsURP;
@@ -109,6 +127,7 @@ namespace DemosaicPlugin
                 harmony = new Harmony("demosaic");
                 harmony.PatchAll(typeof(DemosaicPlugin).Assembly);
                 ApplyInstantiatePatches(harmony);
+                ApplyMaterialSetterPatches(harmony);
                 Logger.LogInfo("Harmony 补丁应用成功，已启用实时对象拦截。");
 
                 if (disableMethods.Value)
@@ -145,7 +164,13 @@ namespace DemosaicPlugin
 
             disableMethods = Config.Bind("Advanced", "DisableMethods", false, "是否启用方法名拦截（反射扫描，谨慎使用）");
             methodDisableKeywords = Config.Bind("Advanced", "MethodDisableKeywords", "censor,mosaic", "方法名拦截关键词");
+            methodExcludeKeywords = Config.Bind("Advanced", "MethodExcludeKeywords", "remove,destroy,clear,disable,hide,off,delete,undo,stop,cancel", "方法名排除词，同时命中排除词的方法不会被拦截（防止误杀去除马赛克的方法）");
             methodPatchTargetAssemblies = Config.Bind("Advanced", "MethodPatchTargetAssemblies", "Assembly-CSharp", "需要进行方法扫描的目标程序集名称，逗号分隔");
+
+            enableCameraEffectDetection = Config.Bind("Advanced", "EnableCameraEffectDetection", true, "是否启用 Camera 后处理组件检测，禁用匹配关键词的后处理效果");
+            cameraEffectKeywords = Config.Bind("Advanced", "CameraEffectKeywords", "mosaic,censor,pixelat,moza,mozic,mazic", "Camera 后处理组件名关键词，匹配的 MonoBehaviour 将被禁用");
+            enableDecalDetection = Config.Bind("Advanced", "EnableDecalDetection", true, "是否启用 Projector/DecalProjector 检测，禁用材质匹配马赛克关键词的投影/贴花");
+            enableMaterialSetterHook = Config.Bind("Advanced", "EnableMaterialSetterHook", true, "是否启用 Renderer 材质 setter Hook，实时捕获动态材质变更（如玩具激活时动态添加马赛克）");
 
             Config.SettingChanged += OnSettingChanged;
         }
@@ -170,11 +195,13 @@ namespace DemosaicPlugin
             );
 
             methodDisableKeywordList = ParseKeywordString(methodDisableKeywords.Value);
+            methodExcludeKeywordList = ParseKeywordString(methodExcludeKeywords.Value);
+            cameraEffectKeywordList = ParseKeywordString(cameraEffectKeywords.Value);
         }
 
         private void CreateTransparentMaterial()
         {
-            // 优先尝试 URP 着色器，然后回退到 HDRP，最后回退到 Standard
+            // 按优先级尝试多种着色器，提升不同渲染管线和裁剪配置下的兼容性
             Shader shader = Shader.Find("Universal Render Pipeline/Lit");
             transparentShaderIsURP = shader != null;
 
@@ -185,8 +212,12 @@ namespace DemosaicPlugin
                     shader = Shader.Find("HD Render Pipeline/Lit");
             }
 
-            if (shader == null)
-                shader = Shader.Find("Standard");
+            // Built-in RP 常见着色器（部分游戏会裁剪 Standard）
+            if (shader == null) shader = Shader.Find("Standard");
+            if (shader == null) shader = Shader.Find("Standard (Specular setup)");
+            if (shader == null) shader = Shader.Find("Unlit/Transparent");
+            if (shader == null) shader = Shader.Find("Unlit/Color");
+            if (shader == null) shader = Shader.Find("Sprites/Default");
 
             if (shader != null)
             {
@@ -196,7 +227,7 @@ namespace DemosaicPlugin
             }
             else
             {
-                Logger.LogError("未能找到 URP Lit、HDRP Lit 或 Standard 着色器。透明模式将无法正常工作。");
+                Logger.LogError("未能找到任何可用着色器，透明模式将无法正常工作。");
             }
         }
 
@@ -205,6 +236,8 @@ namespace DemosaicPlugin
             var mat = new Material(shader);
             // 防止 Unity GC 回收
             mat.hideFlags = HideFlags.HideAndDontSave;
+
+            string shaderName = shader.name;
             if (isURP)
             {
                 mat.SetFloat("_Surface", 1);
@@ -214,8 +247,23 @@ namespace DemosaicPlugin
                 mat.SetInt("_ZWrite", 0);
                 mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
             }
+            else if (shaderName == "Sprites/Default")
+            {
+                // Sprites/Default 不支持 _Mode/_Surface 等属性，直接设置颜色 Alpha 为 0
+                mat.color = Color.clear;
+                mat.renderQueue = 3000;
+                return mat;
+            }
+            else if (shaderName.Contains("Unlit"))
+            {
+                // Unlit 系列着色器无光照属性，仅设置混合模式
+                mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                mat.SetInt("_ZWrite", 0);
+            }
             else
             {
+                // Standard / Standard (Specular setup) / HDRP
                 mat.SetFloat("_Mode", 3);
                 mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
                 mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
@@ -253,12 +301,16 @@ namespace DemosaicPlugin
         internal void NotifySceneUnloaded()
         {
             processedRendererIds.Clear();
+            processedCameraEffectIds.Clear();
+            processedDecalIds.Clear();
             mosaicDetector.ClearCache();
         }
 
         internal void RequestFullScan()
         {
             processedRendererIds.Clear();
+            processedCameraEffectIds.Clear();
+            processedDecalIds.Clear();
             mosaicDetector.ClearCache();
             lifecycleManager?.RestartBatchScan();
         }
@@ -291,6 +343,115 @@ namespace DemosaicPlugin
             foreach (var renderer in renderers)
             {
                 ProcessRenderer(renderer);
+            }
+        }
+
+        /// <summary>
+        /// 扫描场景中所有 Camera 上的 MonoBehaviour 组件，禁用名称匹配关键词的后处理效果。
+        /// </summary>
+        internal void ProcessCameraEffects()
+        {
+            if (!enableCameraEffectDetection.Value || cameraEffectKeywordList == null || cameraEffectKeywordList.Count == 0)
+                return;
+
+            var cameras = UnityEngine.Object.FindObjectsOfType<Camera>();
+            foreach (var cam in cameras)
+            {
+                if (cam == null) continue;
+                var components = cam.gameObject.GetComponents<MonoBehaviour>();
+                foreach (var comp in components)
+                {
+                    if (comp == null) continue;
+                    int compId = comp.GetInstanceID();
+                    if (processedCameraEffectIds.Contains(compId)) continue;
+
+                    string typeName = comp.GetIl2CppType().Name;
+                    bool match = false;
+                    foreach (var keyword in cameraEffectKeywordList)
+                    {
+                        if (typeName.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            match = true;
+                            break;
+                        }
+                    }
+
+                    if (match)
+                    {
+                        comp.enabled = false;
+                        processedCameraEffectIds.Add(compId);
+                        Logger.LogInfo($"已禁用 Camera 后处理组件: {typeName} (on {cam.gameObject.name})");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 扫描场景中的 Projector（Built-in RP）和 DecalProjector（URP）组件，
+        /// 检查其材质是否匹配马赛克关键词，匹配则禁用。
+        /// </summary>
+        internal void ProcessDecalsAndProjectors()
+        {
+            if (!enableDecalDetection.Value) return;
+
+            // 1. 检测 Built-in RP 的 Projector 组件
+            try
+            {
+                var projectors = UnityEngine.Object.FindObjectsOfType<Projector>();
+                foreach (var proj in projectors)
+                {
+                    if (proj == null) continue;
+                    int projId = proj.GetInstanceID();
+                    if (processedDecalIds.Contains(projId)) continue;
+
+                    var mat = proj.material;
+                    if (mat != null && mosaicDetector.CheckMaterialFull(mat))
+                    {
+                        proj.enabled = false;
+                        processedDecalIds.Add(projId);
+                        Logger.LogInfo($"已禁用 Projector: {proj.gameObject.name} (材质: {mat.name})");
+                    }
+                }
+            }
+            catch (Exception) { /* Projector 可能不存在于某些 URP/HDRP 环境 */ }
+
+            // 2. 检测 URP DecalProjector（通过反射，因为编译时可能无引用）
+            try
+            {
+                var decalType = Type.GetType("UnityEngine.Rendering.Universal.DecalProjector, Unity.RenderPipelines.Universal.Runtime");
+                if (decalType == null)
+                    decalType = Type.GetType("UnityEngine.Rendering.Universal.DecalProjector, Unity.RenderPipelines.Universal");
+
+                if (decalType != null)
+                {
+                    var decals = UnityEngine.Object.FindObjectsOfType(Il2CppType.From(decalType));
+                    var matProp = decalType.GetProperty("material") ?? decalType.GetProperty("m_Material");
+
+                    if (decals != null && matProp != null)
+                    {
+                        foreach (var decalObj in decals)
+                        {
+                            if (decalObj == null) continue;
+                            int decalId = decalObj.GetInstanceID();
+                            if (processedDecalIds.Contains(decalId)) continue;
+
+                            var behaviour = decalObj.TryCast<MonoBehaviour>();
+                            if (behaviour == null) continue;
+
+                            var mat = matProp.GetValue(behaviour) as Material;
+                            if (mat != null && mosaicDetector.CheckMaterialFull(mat))
+                            {
+                                behaviour.enabled = false;
+                                processedDecalIds.Add(decalId);
+                                Logger.LogInfo($"已禁用 DecalProjector: {behaviour.gameObject.name} (材质: {mat.name})");
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug($"DecalProjector 检测跳过: {ex.Message}");
             }
         }
 
@@ -335,6 +496,91 @@ namespace DemosaicPlugin
             }
         }
 
+        /// <summary>
+        /// Hook Renderer 的材质 setter，实时捕获动态材质变更（如玩具激活时动态添加马赛克）。
+        /// </summary>
+        private void ApplyMaterialSetterPatches(Harmony harmonyInstance)
+        {
+            var postfix = new HarmonyMethod(typeof(DemosaicPlugin), nameof(MaterialSetterPostfix));
+            int patched = 0;
+
+            // Patch Renderer.set_material
+            var setMaterial = AccessTools.PropertySetter(typeof(Renderer), "material");
+            if (setMaterial != null)
+            {
+                try { harmonyInstance.Patch(setMaterial, postfix: postfix); patched++; }
+                catch (Exception ex) { Logger.LogDebug($"Renderer.material setter patch 失败: {ex.Message}"); }
+            }
+
+            // Patch Renderer.set_sharedMaterial
+            var setSharedMaterial = AccessTools.PropertySetter(typeof(Renderer), "sharedMaterial");
+            if (setSharedMaterial != null)
+            {
+                try { harmonyInstance.Patch(setSharedMaterial, postfix: postfix); patched++; }
+                catch (Exception ex) { Logger.LogDebug($"Renderer.sharedMaterial setter patch 失败: {ex.Message}"); }
+            }
+
+            // Patch Renderer.set_materials
+            var setMaterials = AccessTools.PropertySetter(typeof(Renderer), "materials");
+            if (setMaterials != null)
+            {
+                try { harmonyInstance.Patch(setMaterials, postfix: postfix); patched++; }
+                catch (Exception ex) { Logger.LogDebug($"Renderer.materials setter patch 失败: {ex.Message}"); }
+            }
+
+            // Patch Renderer.set_sharedMaterials
+            var setSharedMaterials = AccessTools.PropertySetter(typeof(Renderer), "sharedMaterials");
+            if (setSharedMaterials != null)
+            {
+                try { harmonyInstance.Patch(setSharedMaterials, postfix: postfix); patched++; }
+                catch (Exception ex) { Logger.LogDebug($"Renderer.sharedMaterials setter patch 失败: {ex.Message}"); }
+            }
+
+            if (patched > 0)
+                Logger.LogInfo($"已 Hook {patched} 个 Renderer 材质 setter，可实时捕获动态材质变更。");
+        }
+
+        /// <summary>
+        /// 材质 setter 的 Postfix：当游戏代码动态设置材质时，立即检测并处理马赛克。
+        /// </summary>
+        private static void MaterialSetterPostfix(Renderer __instance)
+        {
+            if (Instance == null || _isProcessingMaterial) return;
+            if (__instance == null) return;
+            if (!Instance.enableMaterialSetterHook.Value) return;
+
+            try
+            {
+                int rendererId = __instance.GetInstanceID();
+
+                // 帧内去重：同一帧内同一 Renderer 只处理一次
+                int currentFrame = Time.frameCount;
+                if (currentFrame != _lastMaterialHookFrame)
+                {
+                    _lastMaterialHookFrame = currentFrame;
+                    _materialHookFrameDedup.Clear();
+                }
+                if (!_materialHookFrameDedup.Add(rendererId)) return;
+
+                // 从已处理集中移除，允许重新检测（因为材质变了）
+                Instance.processedRendererIds.Remove(rendererId);
+
+                // 检测新材质是否为马赛克
+                if (Instance.mosaicDetector.IsMosaic(__instance))
+                {
+                    _isProcessingMaterial = true;
+                    Instance.mosaicProcessor.Process(__instance);
+                    Instance.processedRendererIds.Add(rendererId);
+                    _isProcessingMaterial = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                _isProcessingMaterial = false;
+                Logger.LogDebug($"材质 setter hook 处理异常: {ex.Message}");
+            }
+        }
+
         private static void InstantiatePatch(UnityEngine.Object __result)
         {
             if (Instance == null) return;
@@ -373,6 +619,7 @@ namespace DemosaicPlugin
 
             Logger.LogInfo("开始动态扫描并禁用匹配关键词的方法...");
             int patchedCount = 0;
+            int skippedByExclusion = 0;
 
             var targetAssemblyNames = new HashSet<string>(
                 methodPatchTargetAssemblies.Value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
@@ -398,16 +645,34 @@ namespace DemosaicPlugin
                                 continue;
                             }
 
-                            if (methodDisableKeywordList.Any(keyword =>
-                                    method.Name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0))
+                            string methodName = method.Name;
+
+                            // 检查是否命中拦截关键词
+                            bool matchesKeyword = methodDisableKeywordList.Any(keyword =>
+                                methodName.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0);
+                            if (!matchesKeyword) continue;
+
+                            // 检查是否命中排除词（防止误杀 RemoveMosaic 等方法）
+                            bool matchesExclusion = methodExcludeKeywordList != null &&
+                                methodExcludeKeywordList.Any(excl =>
+                                    methodName.IndexOf(excl, StringComparison.OrdinalIgnoreCase) >= 0);
+                            if (matchesExclusion)
                             {
-                                try
-                                {
-                                    harmonyInstance.Patch(method,
-                                        new HarmonyMethod(typeof(GenericDisablePatch), nameof(GenericDisablePatch.Prefix)));
-                                    patchedCount++;
-                                }
-                                catch { }
+                                skippedByExclusion++;
+                                Logger.LogDebug($"排除跳过: {type.FullName}.{methodName}");
+                                continue;
+                            }
+
+                            try
+                            {
+                                harmonyInstance.Patch(method,
+                                    new HarmonyMethod(typeof(GenericDisablePatch), nameof(GenericDisablePatch.Prefix)));
+                                patchedCount++;
+                                Logger.LogDebug($"已拦截: {type.FullName}.{methodName}({string.Join(", ", method.GetParameters().Select(p => p.ParameterType.Name))})");
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.LogDebug($"拦截失败: {type.FullName}.{methodName} - {ex.Message}");
                             }
                         }
                     }
@@ -415,7 +680,7 @@ namespace DemosaicPlugin
                 catch (ReflectionTypeLoadException) { }
             }
 
-            Logger.LogInfo($"动态方法扫描完成，共禁用了 {patchedCount} 个方法。");
+            Logger.LogInfo($"动态方法扫描完成，共禁用 {patchedCount} 个方法，排除跳过 {skippedByExclusion} 个。");
         }
 
         public override bool Unload()
@@ -427,6 +692,10 @@ namespace DemosaicPlugin
 
             if (transparentMaterial != null)
                 UnityEngine.Object.Destroy(transparentMaterial);
+
+            processedRendererIds.Clear();
+            processedCameraEffectIds.Clear();
+            processedDecalIds.Clear();
 
             Instance = null;
             Logger.LogInfo("Demosaic 插件已卸载。");
@@ -483,6 +752,21 @@ namespace DemosaicPlugin
             isMosaic = false;
             if (mat == null) return false;
             return materialCache.TryGetValue(mat.GetInstanceID(), out isMosaic);
+        }
+
+        /// <summary>
+        /// 完整检测材质是否为马赛克（含材质名/Shader名/Shader属性），并缓存结果。
+        /// 供 Processor 的 Smart 模式调用，确保判定维度与检测器一致。
+        /// </summary>
+        public bool CheckMaterialFull(Material mat)
+        {
+            if (mat == null) return false;
+            int matId = mat.GetInstanceID();
+            if (materialCache.TryGetValue(matId, out bool cached))
+                return cached;
+            bool result = CheckMaterialIsMosaic(mat);
+            materialCache[matId] = result;
+            return result;
         }
 
         public bool IsObjectNameOrParentMosaic(GameObject go)
@@ -811,12 +1095,11 @@ namespace DemosaicPlugin
         {
             if (mat == null) return false;
 
-            // 优先从共享材质缓存查询
-            if (detector != null && detector.IsMaterialCached(mat, out bool isMosaic))
-            {
-                return isMosaic;
-            }
+            // 委托给检测器的完整检测逻辑（材质名 + Shader名 + Shader属性），并自动缓存
+            if (detector != null)
+                return detector.CheckMaterialFull(mat);
 
+            // 无检测器时的后备路径
             if (materialKeywords != null)
             {
                 for (int i = 0; i < materialKeywords.Count; i++)
@@ -1154,6 +1437,9 @@ namespace DemosaicPlugin
             {
                 _isBatchScanning = false;
                 _batchRenderers = null;
+                // 渲染器扫描完成后，执行 Camera 后处理组件检测
+                DemosaicPlugin.Instance.ProcessCameraEffects();
+                DemosaicPlugin.Instance.ProcessDecalsAndProjectors();
             }
         }
 
@@ -1300,6 +1586,12 @@ namespace DemosaicPlugin
 
     public static class GenericDisablePatch
     {
-        public static bool Prefix() => false;
+        /// <summary>
+        /// 条件性 Prefix：仅当插件实例存在且启用时才拦截，否则放行原始方法。
+        /// </summary>
+        public static bool Prefix()
+        {
+            return DemosaicPlugin.Instance == null;
+        }
     }
 }

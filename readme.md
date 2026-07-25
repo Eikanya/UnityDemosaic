@@ -1,125 +1,200 @@
 # 通用去马赛克插件 (Demosaic Plugin)
 
-这是一个面向 Unity 游戏的 BepInEx 插件，用于按名称、材质、Shader、网格和组件特征识别并隐藏马赛克或审查效果。项目分别提供 Mono 与 IL2CPP 两个版本。
+一个面向 Unity 游戏的 BepInEx 6 插件，通过多维特征识别并移除马赛克/审查效果。支持 Mono 与 IL2CPP 双后端。
 
 ## 功能概览
 
-- 支持 Mono 与 IL2CPP 后端。
-- 支持对象名、材质名、Shader 名、Shader 属性名、Mesh 名、组件名等多维度检测。
-- 使用缓存减少重复检测开销。
-- 使用分批扫描降低单帧卡顿。
-- 支持场景加载扫描、周期扫描、手动热键扫描。
-- IL2CPP 版本支持通过热键导出当前场景 Renderer 信息，方便定位关键词。
-- 支持白名单关键词，避免误伤关键对象。
+### 检测能力
+
+- **多维关键词匹配**：对象名、材质名、Shader 名、Shader 属性名、Mesh 名、组件名、纹理名（Mono）
+- **Camera 后处理检测**：自动禁用 Camera 上名称匹配关键词的 MonoBehaviour 后处理组件
+- **Decal/Projector 检测**：检测 Built-in RP 的 Projector 和 URP 的 DecalProjector 材质
+- **Renderer 材质 setter Hook**：实时捕获游戏运行时动态赋值的马赛克材质（零延迟）
+- **动态方法拦截**：按方法名关键词禁用游戏中施加马赛克的函数（高级功能）
+- **白名单排除**：排除词机制防止误伤正常对象
+
+### 处理模式
+
+| 模式 | 说明 | 风险 |
+|------|------|------|
+| **Smart**（默认） | 仅替换 Renderer 中匹配马赛克关键词的材质槽为透明，保留同对象上的非马赛克材质 | 最低 |
+| Transparent | 替换全部材质为透明 | 中 |
+| Disable | 禁用整个 GameObject | 中 |
+| Destroy（仅 Mono） | 物理销毁对象 | 高，可能导致 NullReference |
+
+### 性能设计
+
+- 分批扫描（可配置每帧处理数量）
+- 材质/Shader/组件检测结果缓存
+- 材质 setter Hook 帧内去重
+- 透明材质 GC 防护（`HideAndDontSave`）
+- 周期扫描 + 事件驱动（Instantiate/SetActive/材质赋值）
 
 ## 安装
 
 ### Mono 游戏
 
-1. 安装 BepInEx 6.x for Mono。
-2. 编译 `Demosaic-mono` 项目。
-3. 将生成的 `demosaic-mono.dll` 放入 `BepInEx/plugins/`。
-4. 启动游戏一次后，在 `BepInEx/config/` 中编辑生成的配置文件。
+1. 安装 [BepInEx 6.x for Mono](https://github.com/BepInEx/BepInEx/releases)
+2. 编译 `Demosaic-mono` 项目，或使用预编译 DLL
+3. 将 `demosaic-mono.dll` 放入 `BepInEx/plugins/`
+4. 启动游戏，在 `BepInEx/config/demosaic.cfg` 中调整配置
 
 ### IL2CPP 游戏
 
-1. 安装 BepInEx 6.x for IL2CPP。
-2. 编译 `Demosaic-il2cpp` 项目。
-3. 将生成的 `Demosaic.IL2CPP.dll` 放入 `BepInEx/plugins/`。
-4. 启动游戏一次后，在 `BepInEx/config/` 中编辑生成的配置文件。
+1. 安装 [BepInEx 6.x for IL2CPP](https://github.com/BepInEx/BepInEx/releases)
+2. 编译 `Demosaic-il2cpp` 项目，或使用预编译 DLL
+3. 将 `Demosaic.IL2CPP.dll` 放入 `BepInEx/plugins/`
+4. 启动游戏，在 `BepInEx/config/demosaic.cfg` 中调整配置
 
-## 主要配置
+## 配置说明
 
-### 通用
+### 通用设置
 
-Mono:
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `EnablePlugin` / `Enable` | `true` | 是否启用插件 |
+| `RemoveMode` / `Mode` | `Smart` | 处理模式 |
+| `ManualScanKey` / `ForceScanHotkey` | `F10` | 手动全场景扫描热键 |
+| `ExportSceneKey` | `F11` | 导出场景 Renderer 信息到日志 |
+| `IncludeInactiveObjects` | `true` | 是否扫描未激活对象 |
+| `DetectParentObjectNames` | `true` | 检测父节点名称（适合 MosaicRoot/Quad 层级） |
+| `LogProcessedObjects` | `false` | 是否记录每个处理对象的日志 |
 
-- `EnablePlugin`: 是否启用插件。
-- `RemoveMode`: `Disable`、`Destroy`、`Transparent`。
-- `ManualScanKey`: 手动扫描热键，默认 `F10`。
-- `IncludeInactiveObjects`: 扫描未激活对象。Unity 2022+ 会优先使用 `FindObjectsByType(..., None)`，减少排序开销。
-- `DetectParentObjectNames`: 检测 Renderer 父节点名称，适合 `MosaicRoot/Quad` 这类层级。
-- `LogProcessedObjects`: 是否为每个处理对象写 Info 日志。大量命中时建议保持 `false`。
+### 扫描设置
 
-IL2CPP:
-
-- `Enable`: 是否启用插件。
-- `Mode`: `Disable` 或 `Transparent`。
-- `ForceScanHotkey`: 手动扫描热键，默认 `F10`。
-- `ExportSceneKey`: 导出场景 Renderer 信息热键，默认 `F11`。
-- `IncludeInactiveObjects`: 扫描未激活对象。Unity 2022+ 会优先使用 `FindObjectsByType(..., None)`，减少排序开销。
-- `DetectParentObjectNames`: 检测 Renderer 父节点名称，适合 `MosaicRoot/Quad` 这类层级。
-- `LogProcessedObjects`: 是否为每个处理对象写 Info 日志。大量命中时建议保持 `false`。
-
-### 扫描
-
-- `PeriodicScanInterval`: 周期扫描间隔，设为 `0` 可禁用。
-- `SceneLoadScanDelay`: 场景加载后的延迟扫描时间。
-- `ScanBatchSize`: 每帧处理数量。插件会强制使用最小值 `1`，避免配置为 `0` 后扫描卡死或报错。
-
-性能建议：
-
-- Unity 2022/2023/6 游戏中，保持 `IncludeInactiveObjects = true` 可以让插件走新版无排序查找路径，同时提升对预加载对象的命中率。
-- 如果场景很大或 IL2CPP 游戏明显卡顿，将 `ScanBatchSize` 降到 `100-200`，并适当增大 `PeriodicScanInterval`。
-- 保持 `LogProcessedObjects = false`。BepInEx 写日志是同步成本，大量马赛克粒子或小块命中时会放大卡顿。
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `PeriodicScanInterval` | `10` | 周期扫描间隔（秒），`0` 禁用 |
+| `SceneLoadScanDelay` | `1.5` | 场景加载后延迟扫描时间（秒） |
+| `ScanBatchSize` | `500` | 每帧处理的对象数量 |
 
 ### 检测关键词
 
-- `ObjectNameKeywords`: 对象名关键词。
-- `MaterialNameKeywords`: 材质名关键词。
-- `ShaderNameKeywords`: Shader 名关键词。
-- `MeshNameKeywords`: Mesh 名关键词。
-- `TextureKeywords`: 纹理名关键词。IL2CPP 版本保留配置，但实际禁用纹理检测以避免底层访问异常。
-- `ComponentNameKeywords`: 组件名关键词。建议谨慎填写，过宽会误伤角色或 UI。
-- `ShaderPropertyKeywords`: Shader 属性名关键词。
-- `ExclusionKeywords`: 白名单关键词。对象名命中后不会被处理。
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `ObjectNameKeywords` | `mosaic,censored,pixelated,mozic,mazic,mozaic,moza` | 对象名关键词 |
+| `MaterialNameKeywords` | `mosaic,censored,pixel,mozic,mazic,moza` | 材质名关键词 |
+| `ShaderNameKeywords` | `mosaic,pixelate,censor,moza,mozic,mazic,mozaic` | Shader 名关键词 |
+| `ShaderPropertyKeywords` | `_PixelSize,_BlockSize,_MosaicFactor` | Shader 属性名关键词 |
+| `MeshNameKeywords` | `censor,mosaic,moza,mozic,mazic,mozaic` | 网格名关键词 |
+| `TextureKeywords` | `mosaic` | 纹理名关键词（IL2CPP 版已禁用） |
+| `ComponentNameKeywords` | *(空)* | 组件名关键词 |
+| `ExclusionKeywords` | *(空)* | 白名单关键词，命中后不处理 |
 
-### 高级方法拦截
+### 高级功能
 
-- `DisableMethods`: 是否启用按方法名拦截。
-- `MethodDisableKeywords`: 方法名关键词。
-- `AssemblyNamesToPatch` 或 `MethodPatchTargetAssemblies`: 目标程序集名。
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `EnableCameraEffectDetection` | `true` | Camera 后处理组件检测 |
+| `CameraEffectKeywords` | `mosaic,censor,pixelat,moza,mozic,mazic` | Camera 组件名关键词 |
+| `EnableDecalDetection` | `true` | Projector/DecalProjector 检测 |
+| `EnableMaterialSetterHook` | `true` | Renderer 材质 setter 实时 Hook |
+| `DisableMethods` | `false` | 方法名拦截（谨慎使用） |
+| `MethodDisableKeywords` | `censor,mosaic` | 方法拦截关键词 |
+| `MethodExcludeKeywords` | `remove,destroy,clear,disable,hide,off,delete,undo,stop,cancel` | 方法排除词（防止误杀去马赛克方法） |
+| `MethodPatchTargetAssemblies` | `Assembly-CSharp` | 目标程序集 |
 
-方法拦截功能风险较高。当前实现只自动拦截非泛型、非特殊名、非抽象、返回值为 `void` 的方法，仍建议优先使用更精确的资源关键词定位。
+## 使用方法
 
-## IL2CPP 场景导出
+### 基本使用
 
-按下 `ExportSceneKey` 后，插件会把当前激活 Renderer 的对象名、材质名、Shader 名和 Mesh 名输出到 `BepInEx/LogOutput.log`，格式类似：
+1. 安装后启动游戏，插件自动以 Smart 模式工作
+2. 如果马赛克未被去除，按 `F11` 导出场景信息到 `BepInEx/LogOutput.log`
+3. 在日志中找到马赛克对象的名称/材质/Shader，将关键词添加到对应配置
+4. 按 `F10` 强制重新扫描
+
+### 场景导出格式
 
 ```text
 [Demosaic Export] GO: CensorPlane | Material: mosaic_mat | Shader: Unlit/Mosaic | Mesh: Plane
 ```
 
-将可疑名称加入对应关键词后，按 `F10` 重新扫描即可。
+### Smart 模式原理
+
+```
+Renderer 材质槽:
+  [0] body_skin     → 不含关键词 → 保留 ✓
+  [1] mosaic_overlay → 含 "mosaic" → 替换为透明 ✓
+  [2] hair_material  → 不含关键词 → 保留 ✓
+```
+
+仅替换命中马赛克关键词的材质槽，保留身体、头发等非马赛克材质。
 
 ## 编译
 
-每个项目目录下需要准备 `libs` 文件夹，放入目标游戏和 BepInEx 对应版本的依赖 DLL。
+### 前置条件
+
+- .NET SDK 6.0+
+- 各变体的 `libs/` 目录已填充（见 [AGENTS.md](AGENTS.md) 获取依赖来源）
+
+### 构建命令
 
 ```bash
-dotnet build -c Release
+# IL2CPP 变体
+dotnet build Demosaic-il2cpp/Demosaic-il2cppPlugin.csproj -c Release
+
+# Mono 变体
+dotnet build Demosaic-mono/DemosaicPlugin.csproj -c Release
 ```
 
-输出位置：
-
-- Mono: `Demosaic-mono/bin/Release/netstandard2.1/demosaic-mono.dll`
+产出路径：
 - IL2CPP: `Demosaic-il2cpp/bin/Release/netstandard2.1/Demosaic.IL2CPP.dll`
+- Mono: `Demosaic-mono/bin/Release/netstandard2.1/demosaic-mono.dll`
 
 ## 常见问题
 
 ### 整个角色或 UI 消失
 
-通常是关键词过宽。优先检查 `ComponentNameKeywords`、`MaterialNameKeywords` 和 `ObjectNameKeywords`，并用 `ExclusionKeywords` 白名单保护不应处理的对象。
+关键词过宽导致误判。解决方案：
+1. 将角色关键对象名添加到 `ExclusionKeywords`
+2. 收窄 `ComponentNameKeywords` 和 `ObjectNameKeywords`
+3. 确认使用 Smart 模式（非 Disable/Destroy）
 
-### 动态生成的对象没有立即处理
+### 玩具/道具激活时马赛克有延迟
 
-插件会拦截常见 `SetActive` 和 `Instantiate` 重载，但不同 Unity 版本或游戏封装方式可能仍有遗漏。周期扫描和手动扫描会作为兜底。
+插件已 Hook：
+- `GameObject.SetActive` → 激活时立即检测
+- `Object.Instantiate` → 新生成对象立即检测
+- `Renderer.material/sharedMaterials` setter → 动态材质赋值立即检测
 
-如果对象层级是父节点名包含 `mosaic/censor`，而实际 Renderer 在子节点 `Quad/Plane` 上，请开启 `DetectParentObjectNames`。
+如果仍有延迟，可能是游戏通过 Shader 参数（如 `_MosaicFactor`）激活马赛克。此时可缩短 `PeriodicScanInterval` 或使用 `DisableMethods` 拦截对应函数。
 
 ### 透明模式不生效
 
-透明模式依赖可用的 `Standard` Shader。URP/HDRP 或深度写入特殊的 Shader 可能需要针对游戏单独适配。
+插件按以下顺序查找可用 Shader 创建透明材质：
+1. `Universal Render Pipeline/Lit`（URP）
+2. `HDRP/Lit` / `HD Render Pipeline/Lit`
+3. `Standard`
+4. `Standard (Specular setup)`
+5. `Unlit/Transparent`
+6. `Unlit/Color`
+7. `Sprites/Default`
+
+如果全部不可用（极端裁剪），Smart/Transparent 模式将降级为 Disable。
+
+### IL2CPP 纹理检测被禁用
+
+IL2CPP 环境下 `GetTexturePropertyNameIDs` 可能触发 `AccessViolationException`，因此纹理名检测已安全禁用。如需通过纹理识别马赛克，请使用材质名或 Shader 属性名替代。
+
+## 版本历史
+
+### v1.5.0
+
+- **Smart 模式增强**：修复空父节点降级为 Disable 的问题，统一 IsMosaicMaterial 判定维度
+- **新增 Camera 后处理检测**：自动禁用匹配关键词的后处理组件
+- **新增 Decal/Projector 检测**：支持 Built-in Projector 和 URP DecalProjector
+- **新增 Renderer 材质 setter Hook**：零延迟捕获动态材质赋值
+- **动态方法拦截优化**：新增排除词防误杀、条件性 Prefix、详细日志
+- **扩展透明材质 Shader 兼容性**：支持 Sprites/Default、Unlit 系列
+- **Mono 版新增 F11 场景导出**
+- **Mono 版透明材质 GC 防护**
+- **两变体关键词配置统一**
+
+### v1.4.x
+
+- 初始发布，支持 Disable/Transparent/Smart 模式
+- 多维关键词检测 + 分批扫描
+- Harmony 方法拦截（高级功能）
 
 ## 许可
 
