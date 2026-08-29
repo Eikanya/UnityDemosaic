@@ -92,7 +92,7 @@ namespace DemosaicPlugin
         private readonly HashSet<int> processedRendererIds = new HashSet<int>();
         private readonly HashSet<int> processedCameraEffectIds = new HashSet<int>();
         private readonly HashSet<int> processedDecalIds = new HashSet<int>();
-        private static bool _isProcessingMaterial = false; // 防止材质 setter hook 递归
+        internal static bool IsProcessingMaterial = false; // 防止材质 setter hook 递归
         private static int _lastMaterialHookFrame = -1;
         private static readonly HashSet<int> _materialHookFrameDedup = new HashSet<int>();
         private Material transparentMaterial;
@@ -127,7 +127,8 @@ namespace DemosaicPlugin
                 harmony = new Harmony("demosaic");
                 harmony.PatchAll(typeof(DemosaicPlugin).Assembly);
                 ApplyInstantiatePatches(harmony);
-                ApplyMaterialSetterPatches(harmony);
+                if (enableMaterialSetterHook.Value)
+                    ApplyMaterialSetterPatches(harmony);
                 Logger.LogInfo("Harmony 补丁应用成功，已启用实时对象拦截。");
 
                 if (disableMethods.Value)
@@ -170,7 +171,7 @@ namespace DemosaicPlugin
             enableCameraEffectDetection = Config.Bind("Advanced", "EnableCameraEffectDetection", true, "是否启用 Camera 后处理组件检测，禁用匹配关键词的后处理效果");
             cameraEffectKeywords = Config.Bind("Advanced", "CameraEffectKeywords", "mosaic,censor,pixelat,moza,mozic,mazic", "Camera 后处理组件名关键词，匹配的 MonoBehaviour 将被禁用");
             enableDecalDetection = Config.Bind("Advanced", "EnableDecalDetection", true, "是否启用 Projector/DecalProjector 检测，禁用材质匹配马赛克关键词的投影/贴花");
-            enableMaterialSetterHook = Config.Bind("Advanced", "EnableMaterialSetterHook", true, "是否启用 Renderer 材质 setter Hook，实时捕获动态材质变更（如玩具激活时动态添加马赛克）");
+            enableMaterialSetterHook = Config.Bind("Advanced", "EnableMaterialSetterHook", false, "是否启用 Renderer 材质 setter Hook（仅单个材质setter，实验性功能，默认关闭以避免IL2CPP栈溢出）");
 
             Config.SettingChanged += OnSettingChanged;
         }
@@ -498,13 +499,16 @@ namespace DemosaicPlugin
 
         /// <summary>
         /// Hook Renderer 的材质 setter，实时捕获动态材质变更（如玩具激活时动态添加马赛克）。
+        /// 注：IL2CPP 下严禁 Hook materials/sharedMaterials 数组 setter，否则 Il2CppInterop 桥接数组参数时会引发 StackOverflow 崩溃。
         /// </summary>
         private void ApplyMaterialSetterPatches(Harmony harmonyInstance)
         {
+            if (!enableMaterialSetterHook.Value) return;
+
             var postfix = new HarmonyMethod(typeof(DemosaicPlugin), nameof(MaterialSetterPostfix));
             int patched = 0;
 
-            // Patch Renderer.set_material
+            // Patch Renderer.set_material (单个材质)
             var setMaterial = AccessTools.PropertySetter(typeof(Renderer), "material");
             if (setMaterial != null)
             {
@@ -512,7 +516,7 @@ namespace DemosaicPlugin
                 catch (Exception ex) { Logger.LogDebug($"Renderer.material setter patch 失败: {ex.Message}"); }
             }
 
-            // Patch Renderer.set_sharedMaterial
+            // Patch Renderer.set_sharedMaterial (单个材质)
             var setSharedMaterial = AccessTools.PropertySetter(typeof(Renderer), "sharedMaterial");
             if (setSharedMaterial != null)
             {
@@ -520,21 +524,8 @@ namespace DemosaicPlugin
                 catch (Exception ex) { Logger.LogDebug($"Renderer.sharedMaterial setter patch 失败: {ex.Message}"); }
             }
 
-            // Patch Renderer.set_materials
-            var setMaterials = AccessTools.PropertySetter(typeof(Renderer), "materials");
-            if (setMaterials != null)
-            {
-                try { harmonyInstance.Patch(setMaterials, postfix: postfix); patched++; }
-                catch (Exception ex) { Logger.LogDebug($"Renderer.materials setter patch 失败: {ex.Message}"); }
-            }
-
-            // Patch Renderer.set_sharedMaterials
-            var setSharedMaterials = AccessTools.PropertySetter(typeof(Renderer), "sharedMaterials");
-            if (setSharedMaterials != null)
-            {
-                try { harmonyInstance.Patch(setSharedMaterials, postfix: postfix); patched++; }
-                catch (Exception ex) { Logger.LogDebug($"Renderer.sharedMaterials setter patch 失败: {ex.Message}"); }
-            }
+            // 注意：IL2CPP 环境下不能 Patch set_materials 或 set_sharedMaterials 数组属性，
+            // 否则 Il2CppInterop 在生成 (il2cpp -> managed) 委托转换 Il2CppReferenceArray 时会引发死锁/递归栈溢出崩溃。
 
             if (patched > 0)
                 Logger.LogInfo($"已 Hook {patched} 个 Renderer 材质 setter，可实时捕获动态材质变更。");
@@ -545,7 +536,7 @@ namespace DemosaicPlugin
         /// </summary>
         private static void MaterialSetterPostfix(Renderer __instance)
         {
-            if (Instance == null || _isProcessingMaterial) return;
+            if (Instance == null || IsProcessingMaterial) return;
             if (__instance == null) return;
             if (!Instance.enableMaterialSetterHook.Value) return;
 
@@ -562,21 +553,23 @@ namespace DemosaicPlugin
                 }
                 if (!_materialHookFrameDedup.Add(rendererId)) return;
 
-                // 从已处理集中移除，允许重新检测（因为材质变了）
-                Instance.processedRendererIds.Remove(rendererId);
-
                 // 检测新材质是否为马赛克
                 if (Instance.mosaicDetector.IsMosaic(__instance))
                 {
-                    _isProcessingMaterial = true;
-                    Instance.mosaicProcessor.Process(__instance);
-                    Instance.processedRendererIds.Add(rendererId);
-                    _isProcessingMaterial = false;
+                    IsProcessingMaterial = true;
+                    try
+                    {
+                        Instance.mosaicProcessor.Process(__instance);
+                        Instance.processedRendererIds.Add(rendererId);
+                    }
+                    finally
+                    {
+                        IsProcessingMaterial = false;
+                    }
                 }
             }
             catch (Exception ex)
             {
-                _isProcessingMaterial = false;
                 Logger.LogDebug($"材质 setter hook 处理异常: {ex.Message}");
             }
         }
@@ -849,20 +842,24 @@ namespace DemosaicPlugin
                 }
             }
 
-            foreach (var mat in renderer.sharedMaterials)
+            var sharedMats = renderer.sharedMaterials;
+            if (sharedMats != null)
             {
-                if (mat == null) continue;
-
-                int matId = mat.GetInstanceID();
-                if (materialCache.TryGetValue(matId, out bool isMatMosaic))
+                foreach (var mat in sharedMats)
                 {
-                    if (isMatMosaic) return true;
-                    continue;
-                }
+                    if (mat == null) continue;
 
-                bool isCurrentMatMosaic = CheckMaterialIsMosaic(mat);
-                materialCache[matId] = isCurrentMatMosaic;
-                if (isCurrentMatMosaic) return true;
+                    int matId = mat.GetInstanceID();
+                    if (materialCache.TryGetValue(matId, out bool isMatMosaic))
+                    {
+                        if (isMatMosaic) return true;
+                        continue;
+                    }
+
+                    bool isCurrentMatMosaic = CheckMaterialIsMosaic(mat);
+                    materialCache[matId] = isCurrentMatMosaic;
+                    if (isCurrentMatMosaic) return true;
+                }
             }
 
             if (meshKeywordList != null && meshKeywordList.Count > 0)
@@ -1006,52 +1003,76 @@ namespace DemosaicPlugin
 
         public void Process(Renderer renderer)
         {
-            var transMat = GetTransparentMaterial();
+            if (renderer == null) return;
 
-            // 禁用阴影，防止透明面片投射黑影块导致阴影区变色/暗色斑块
             try
             {
-                renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-                renderer.receiveShadows = false;
-            }
-            catch { }
+                DemosaicPlugin.IsProcessingMaterial = true;
 
-            if (removeMode == RemoveMode.Smart)
-            {
-                if (transMat != null)
-                {
-                    ProcessSmart(renderer, transMat);
-                    return;
-                }
-                else
-                {
-                    logger.LogWarning($"透明材质缺失，Smart 模式降级为 Disable: {renderer.name}");
-                }
-            }
-            else if (removeMode == RemoveMode.Transparent)
-            {
-                if (transMat != null)
-                {
-                    var sharedMats = renderer.sharedMaterials;
-                    renderer.sharedMaterials = GetTransparentMaterialArray(sharedMats.Length, transMat);
-                    if (logProcessedObjects)
-                        logger.LogInfo($"已去除马赛克 (透明模式): {renderer.name}");
-                    return;
-                }
-                else
-                {
-                    logger.LogWarning($"透明材质缺失，降级为 Disable 模式: {renderer.name}");
-                }
-            }
+                var transMat = GetTransparentMaterial();
 
-            renderer.gameObject.SetActive(false);
-            if (logProcessedObjects)
-                logger.LogInfo($"已去除马赛克 (禁用模式): {renderer.name}");
+                // 禁用阴影，防止透明面片投射黑影块导致阴影区变色/暗色斑块
+                try
+                {
+                    renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                    renderer.receiveShadows = false;
+                }
+                catch { }
+
+                if (removeMode == RemoveMode.Smart)
+                {
+                    if (transMat != null)
+                    {
+                        ProcessSmart(renderer, transMat);
+                        return;
+                    }
+                    else
+                    {
+                        logger.LogWarning($"透明材质缺失，Smart 模式降级为 Disable: {renderer.name}");
+                    }
+                }
+                else if (removeMode == RemoveMode.Transparent)
+                {
+                    if (transMat != null)
+                    {
+                        var sharedMats = renderer.sharedMaterials;
+                        int matCount = sharedMats != null ? sharedMats.Length : 0;
+                        if (matCount > 0)
+                        {
+                            renderer.sharedMaterials = GetTransparentMaterialArray(matCount, transMat);
+                            if (logProcessedObjects)
+                                logger.LogInfo($"已去除马赛克 (透明模式): {renderer.name}");
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        logger.LogWarning($"透明材质缺失，降级为 Disable 模式: {renderer.name}");
+                    }
+                }
+
+                renderer.gameObject.SetActive(false);
+                if (logProcessedObjects)
+                    logger.LogInfo($"已去除马赛克 (禁用模式): {renderer.name}");
+            }
+            finally
+            {
+                DemosaicPlugin.IsProcessingMaterial = false;
+            }
         }
 
         private void ProcessSmart(Renderer renderer, Material transMat)
         {
             var sharedMats = renderer.sharedMaterials;
+            if (sharedMats == null || sharedMats.Length == 0)
+            {
+                if (detector != null && detector.IsObjectNameOrParentMosaic(renderer.gameObject))
+                {
+                    renderer.gameObject.SetActive(false);
+                }
+                return;
+            }
+
             bool hasMosaicMat = false;
 
             for (int i = 0; i < sharedMats.Length; i++)
@@ -1142,11 +1163,13 @@ namespace DemosaicPlugin
     {
         private static bool _legacyInputAvailable = true;
         private static bool _warned = false;
-        private static System.Reflection.MethodInfo _keyboardCurrentMethod;
-        private static System.Reflection.MethodInfo _keyIsPressedMethod;
-        private static object _keyboardInstance;
+        private static PropertyInfo _keyboardCurrentProp;
+        private static MethodInfo _keyboardIndexer;
+        private static PropertyInfo _keyWasPressedProp;
+        private static PropertyInfo _keyIsPressedProp;
         private static bool _newInputInitialized = false;
-        private static readonly Dictionary<KeyCode, object[]> _keyArgsCache = new Dictionary<KeyCode, object[]>();
+        private static Type _keyEnumType;
+        private static readonly Dictionary<KeyCode, object> _keyEnumCache = new Dictionary<KeyCode, object>();
 
         /// <summary>
         /// 安全检测按键按下，兼容旧版 Input 和新版 Input System。
@@ -1162,9 +1185,10 @@ namespace DemosaicPlugin
                 }
                 catch (Exception ex)
                 {
-                    // IL2CPP 环境下异常被 Il2CppException 包装，无法直接 catch InvalidOperationException
-                    // 通过消息判断是否为 Input System 冲突
-                    if (ex.Message.Contains("Input System") || ex.InnerException?.Message.Contains("Input System") == true)
+                    // IL2CPP 环境下异常可能被 Il2CppException 包装
+                    if (ex is InvalidOperationException ||
+                        ex.Message.Contains("Input System") ||
+                        ex.InnerException?.Message.Contains("Input System") == true)
                     {
                         _legacyInputAvailable = false;
                         if (!_warned)
@@ -1185,18 +1209,22 @@ namespace DemosaicPlugin
             return TryNewInputSystemKeyDown(key);
         }
 
-        private static object[] GetKeyArgs(KeyCode key)
+        private static object GetKeyEnumValue(KeyCode key)
         {
-            if (!_keyArgsCache.TryGetValue(key, out var args))
+            if (_keyEnumType == null) return null;
+            if (!_keyEnumCache.TryGetValue(key, out var keyObj))
             {
-                var keyEnum = MapKeyCodeToKey(key);
-                if (keyEnum != null)
+                try
                 {
-                    args = new object[] { keyEnum };
-                    _keyArgsCache[key] = args;
+                    keyObj = Enum.Parse(_keyEnumType, key.ToString(), ignoreCase: true);
                 }
+                catch
+                {
+                    keyObj = null;
+                }
+                _keyEnumCache[key] = keyObj;
             }
-            return args;
+            return keyObj;
         }
 
         private static bool TryNewInputSystemKeyDown(KeyCode key)
@@ -1209,19 +1237,30 @@ namespace DemosaicPlugin
                     _newInputInitialized = true;
                 }
 
-                if (_keyboardCurrentMethod == null || _keyIsPressedMethod == null) return false;
+                if (_keyboardCurrentProp == null || _keyboardIndexer == null || (_keyWasPressedProp == null && _keyIsPressedProp == null))
+                    return false;
 
-                if (_keyboardInstance == null)
+                var keyboardInstance = _keyboardCurrentProp.GetValue(null);
+                if (keyboardInstance == null) return false;
+
+                var keyEnum = GetKeyEnumValue(key);
+                if (keyEnum == null) return false;
+
+                var keyControl = _keyboardIndexer.Invoke(keyboardInstance, new[] { keyEnum });
+                if (keyControl == null) return false;
+
+                if (_keyWasPressedProp != null)
                 {
-                    _keyboardInstance = _keyboardCurrentMethod.Invoke(null, null);
-                    if (_keyboardInstance == null) return false;
+                    var result = _keyWasPressedProp.GetValue(keyControl);
+                    if (result is bool b) return b;
+                }
+                else if (_keyIsPressedProp != null)
+                {
+                    var result = _keyIsPressedProp.GetValue(keyControl);
+                    if (result is bool b) return b;
                 }
 
-                var args = GetKeyArgs(key);
-                if (args == null) return false;
-
-                var result = _keyIsPressedMethod.Invoke(_keyboardInstance, args);
-                return result is bool b && b;
+                return false;
             }
             catch
             {
@@ -1233,9 +1272,8 @@ namespace DemosaicPlugin
         {
             try
             {
-                // 查找 UnityEngine.InputSystem.Keyboard 类型
                 Type keyboardType = null;
-                Type keyEnumType = null;
+                _keyEnumType = null;
 
                 // 优先通过 Il2CppInterop 查找（IL2CPP 环境下 InputSystem 是 Il2Cpp 类型）
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
@@ -1244,59 +1282,56 @@ namespace DemosaicPlugin
                     if (asmName.Contains("InputSystem") || asmName.Contains("Unity.InputSystem"))
                     {
                         if (keyboardType == null) keyboardType = asm.GetType("UnityEngine.InputSystem.Keyboard");
-                        if (keyEnumType == null) keyEnumType = asm.GetType("UnityEngine.InputSystem.Key");
+                        if (_keyEnumType == null) _keyEnumType = asm.GetType("UnityEngine.InputSystem.Key");
                     }
                 }
 
                 // 备用：Type.GetType
                 if (keyboardType == null)
                     keyboardType = Type.GetType("UnityEngine.InputSystem.Keyboard, Unity.InputSystem");
-                if (keyEnumType == null)
-                    keyEnumType = Type.GetType("UnityEngine.InputSystem.Key, Unity.InputSystem");
+                if (_keyEnumType == null)
+                    _keyEnumType = Type.GetType("UnityEngine.InputSystem.Key, Unity.InputSystem");
 
-                if (keyboardType == null)
+                if (keyboardType == null || _keyEnumType == null)
                 {
-                    DemosaicPlugin.Logger.LogWarning("未能找到 InputSystem.Keyboard 类型，快捷键功能将不可用。");
+                    DemosaicPlugin.Logger.LogWarning("未能找到 InputSystem.Keyboard 或 Key 类型，快捷键功能将不可用。");
                     return;
                 }
 
-                _keyboardCurrentMethod = keyboardType.GetProperty("current", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetMethod;
+                _keyboardCurrentProp = keyboardType.GetProperty("current", BindingFlags.Public | BindingFlags.Static);
+                _keyboardIndexer = keyboardType.GetProperty("Item", new[] { _keyEnumType })?.GetGetMethod()
+                                  ?? keyboardType.GetMethod("get_Item", new[] { _keyEnumType });
 
-                // Keyboard 的 IsKeyPressed(Key) 方法
-                if (keyEnumType != null)
+                // 查找 ButtonControl / KeyControl 的 wasPressedThisFrame / isPressed 属性
+                Type buttonControlType = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    _keyIsPressedMethod = keyboardType.GetMethod("IsKeyPressed", new[] { keyEnumType });
-                    if (_keyIsPressedMethod == null)
+                    var asmName = asm.GetName().Name;
+                    if (asmName.Contains("InputSystem") || asmName.Contains("Unity.InputSystem"))
                     {
-                        // 尝试 wasKeyPressedThisFrame（部分版本方法名不同）
-                        _keyIsPressedMethod = keyboardType.GetMethod("wasKeyPressedThisFrame", new[] { keyEnumType });
+                        buttonControlType = asm.GetType("UnityEngine.InputSystem.Controls.ButtonControl")
+                                         ?? asm.GetType("UnityEngine.InputSystem.Controls.KeyControl");
+                        if (buttonControlType != null) break;
                     }
                 }
+                if (buttonControlType == null)
+                    buttonControlType = Type.GetType("UnityEngine.InputSystem.Controls.ButtonControl, Unity.InputSystem")
+                                     ?? Type.GetType("UnityEngine.InputSystem.Controls.KeyControl, Unity.InputSystem");
 
-                if (_keyboardCurrentMethod != null && _keyIsPressedMethod != null)
+                if (buttonControlType != null)
+                {
+                    _keyWasPressedProp = buttonControlType.GetProperty("wasPressedThisFrame");
+                    _keyIsPressedProp = buttonControlType.GetProperty("isPressed");
+                }
+
+                if (_keyboardCurrentProp != null && _keyboardIndexer != null && (_keyWasPressedProp != null || _keyIsPressedProp != null))
                     DemosaicPlugin.Logger.LogInfo("新版 Input System 键盘支持初始化成功。");
                 else
-                    DemosaicPlugin.Logger.LogWarning($"Input System Keyboard 方法未找到 (current={_keyboardCurrentMethod != null}, isPressed={_keyIsPressedMethod != null})，快捷键不可用。");
+                    DemosaicPlugin.Logger.LogWarning($"Input System Keyboard 初始化部分缺失 (current={_keyboardCurrentProp != null}, indexer={_keyboardIndexer != null}, wasPressed={_keyWasPressedProp != null})，快捷键可能不可用。");
             }
             catch (Exception ex)
             {
                 DemosaicPlugin.Logger.LogWarning($"初始化新版 Input System 失败: {ex.Message}。快捷键功能将不可用。");
-            }
-        }
-
-        private static object MapKeyCodeToKey(KeyCode keyCode)
-        {
-            // InputSystem.Key 枚举值名称与 KeyCode 大部分一致
-            string keyName = keyCode.ToString();
-            try
-            {
-                var keyEnumType = _keyIsPressedMethod?.GetParameters()[0].ParameterType;
-                if (keyEnumType == null) return null;
-                return Enum.Parse(keyEnumType, keyName, ignoreCase: true);
-            }
-            catch
-            {
-                return null;
             }
         }
     }
@@ -1406,6 +1441,12 @@ namespace DemosaicPlugin
         {
             if (_isBatchScanning) return;
             _batchRenderers = SceneObjectFinder.FindRenderers(DemosaicPlugin.Instance.IncludeInactiveObjectsValue);
+            if (_batchRenderers == null || _batchRenderers.Length == 0)
+            {
+                _isBatchScanning = false;
+                _batchRenderers = null;
+                return;
+            }
             _currentBatchIndex = 0;
             _isBatchScanning = true;
             DemosaicPlugin.Logger.LogDebug($"开始分批扫描 {_batchRenderers.Length} 个渲染器...");
@@ -1448,6 +1489,13 @@ namespace DemosaicPlugin
         {
             if (_isExporting) return;
             _exportRenderers = SceneObjectFinder.FindRenderers(false);
+            if (_exportRenderers == null || _exportRenderers.Length == 0)
+            {
+                _isExporting = false;
+                _exportRenderers = null;
+                DemosaicPlugin.Logger.LogInfo("场景中未找到任何渲染器。");
+                return;
+            }
             _exportCurrentIndex = 0;
             _isExporting = true;
             DemosaicPlugin.Logger.LogInfo($"准备导出 {_exportRenderers.Length} 个渲染器信息...");
