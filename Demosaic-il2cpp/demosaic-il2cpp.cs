@@ -134,17 +134,17 @@ namespace DemosaicPlugin
             sceneLoadScanDelay = Config.Bind("Scan", "SceneLoadScanDelay", 1.5f, "新场景加载后延迟扫描的时间（秒）。");
             scanBatchSize = Config.Bind("Scan", "ScanBatchSize", 500, "全场景扫描时每帧处理的对象数量，防止卡顿。");
 
-            objectKeywords = Config.Bind("Detection", "ObjectNameKeywords", "mosaic,censored,pixelated,mozic,mazic,mozaic", "游戏对象名称的关键词，逗号分隔");
-            materialKeywords = Config.Bind("Detection", "MaterialNameKeywords", "mosaic,censored,pixel,mozic,mazic", "材质名称的关键词，逗号分隔");
-            textureKeywords = Config.Bind("Detection", "TextureKeywords", "mosaic", "纹理名称的关键词，逗号分隔");
-            shaderKeywords = Config.Bind("Detection", "ShaderNameKeywords", "mosaic,pixelate,censor,moza,mozic,mazic,mozaic", "着色器名称的关键词，逗号分隔");
-            meshKeywords = Config.Bind("Detection", "MeshNameKeywords", "censor,mosaic,moza,mozic,mazic,mozaic", "网格名称的关键词，逗号分隔");
+            objectKeywords = Config.Bind("Detection", "ObjectNameKeywords", "mosaic,censored,pixelated,mozic,mazic,mozaic,モザイク,pixelation", "游戏对象名称的关键词，逗号分隔");
+            materialKeywords = Config.Bind("Detection", "MaterialNameKeywords", "mosaic,censored,pixel,mozic,mazic,モザイク,pixelation", "材质名称的关键词，逗号分隔");
+            textureKeywords = Config.Bind("Detection", "TextureKeywords", "mosaic,モザイク,pixelation", "纹理名称的关键词，逗号分隔");
+            shaderKeywords = Config.Bind("Detection", "ShaderNameKeywords", "mosaic,pixelate,censor,moza,mozic,mazic,mozaic,モザイク,pixelation", "着色器名称的关键词，逗号分隔");
+            meshKeywords = Config.Bind("Detection", "MeshNameKeywords", "censor,mosaic,moza,mozic,mazic,mozaic,モザイク,pixelation", "网格名称的关键词，逗号分隔");
             componentNameKeywords = Config.Bind("Detection", "ComponentNameKeywords", "", "组件名称的关键词，逗号分隔");
             shaderPropertyKeywords = Config.Bind("Detection", "ShaderPropertyKeywords", "_PixelSize,_BlockSize,_MosaicFactor", "着色器属性名称的关键词，逗号分隔");
             exclusionKeywords = Config.Bind("Detection", "ExclusionKeywords", "", "白名单关键词（最高优先级），逗号分隔");
 
             disableMethods = Config.Bind("Advanced", "DisableMethods", false, "是否启用方法名拦截（反射扫描，谨慎使用）");
-            methodDisableKeywords = Config.Bind("Advanced", "MethodDisableKeywords", "censor,mosaic", "方法名拦截关键词");
+            methodDisableKeywords = Config.Bind("Advanced", "MethodDisableKeywords", "censor,mosaic,モザイク,pixelation", "方法名拦截关键词");
             methodPatchTargetAssemblies = Config.Bind("Advanced", "MethodPatchTargetAssemblies", "Assembly-CSharp", "需要进行方法扫描的目标程序集名称，逗号分隔");
 
             Config.SettingChanged += OnSettingChanged;
