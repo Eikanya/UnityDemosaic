@@ -272,8 +272,8 @@ namespace DemosaicPlugin
                     if (_switchTimer >= due || (_switchDirty && _switchTimer >= 0.25f))
                     {
                         _switchTimer = 0f;
-                        _switchDirty = false;
                         ProcessMosaicSwitches();
+                        _switchDirty = false;
                         ApplyMaterialMosaicFix();
                     }
                 }
@@ -410,6 +410,7 @@ namespace DemosaicPlugin
                 ProcessCameraEffects();
                 ProcessDecalsAndProjectors();
                 ProcessMosaicSwitches();
+                ApplyMaterialMosaicFix();
                 return;
             }
 
@@ -452,6 +453,7 @@ namespace DemosaicPlugin
                 ProcessCameraEffects();
                 ProcessDecalsAndProjectors();
                 ProcessMosaicSwitches();
+                ApplyMaterialMosaicFix();
                 _detector.TrimCachesIfOversized();
             }
         }
@@ -506,10 +508,29 @@ namespace DemosaicPlugin
             // 旧实现跳过自身 Renderer，导致"父节点命中但自身材质命中"的对象被漏掉）
             var renderers = go.GetComponentsInChildren<Renderer>(true);
             bool anyProcessed = false;
+            bool hasMaterialFix = false;
+            bool trackMaterialFix = _settings.EnableMaterialMosaicOff.Value;
             for (int i = 0; i < renderers.Length; i++)
             {
-                if (ProcessRenderer(renderers[i]))
+                var r = renderers[i];
+                if (r == null) continue;
+                if (ProcessRenderer(r))
                     anyProcessed = true;
+                if (trackMaterialFix)
+                {
+                    TrackMaterialFixTarget(r);
+                    if (_materialFixIds.Contains(r.GetInstanceID()))
+                        hasMaterialFix = true;
+                }
+            }
+
+            if (hasMaterialFix)
+            {
+                anyProcessed = true;
+                _switchDirty = true;
+                ProcessMosaicSwitches();
+                _switchDirty = false;
+                ApplyMaterialMosaicFix();
             }
 
             // 子树里出现过马赛克就不记干净，下次激活仍需复核

@@ -74,7 +74,7 @@ private void TrackMaterialFixTarget(Renderer renderer)
 
                 var shader = material.shader;
                 if (shader == null || !ShaderInScope(shader)) continue;
-                if (!HasMosaicProperty(shader)) continue;
+                if (!HasMosaicProperty(shader) && !HasMosaicPass(material, shader)) continue;
 
                 if (_materialFixIds.Add(id)) _materialFixTargets.Add(renderer);
                 return;
@@ -99,6 +99,36 @@ private bool HasMosaicProperty(Shader shader)
                 if (MosaicDetector.ContainsAny(props[i].Name, keywords)) return true;
             }
             return false;
+        }
+
+private bool HasMosaicPass(Material material, Shader shader)
+        {
+            var keywords = _settings.MosaicMaterialPropertyArray;
+            if (keywords == null || keywords.Length == 0) return false;
+
+            int shaderId = shader.GetInstanceID();
+            if (_shaderHasMosaicPassCache.TryGetValue(shaderId, out var cached)) return cached;
+
+            bool found = false;
+            try
+            {
+                int passCount = material.passCount;
+                for (int p = 0; p < passCount; p++)
+                {
+                    string passName = material.GetPassName(p);
+                    if (!string.IsNullOrEmpty(passName) && MosaicDetector.ContainsAny(passName, keywords))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            _shaderHasMosaicPassCache[shaderId] = found;
+            return found;
         }
 
 private static string GetToggleKeyword(Shader shader, int index)
@@ -250,10 +280,112 @@ private bool ZeroMaterialMosaicProperties(Material material, out string detail)
                 }
             }
 
+            // 针对 LIDPatched 等把马赛克做成独立 Pass（如 Pass 3="" GrabPass, Pass 4="LID_MOSAIC"）的 Shader：
+            // 枚举材质的所有 Pass 名，将命中马赛克关键词的 Pass（如 "LID_MOSAIC"）及尾随无名 GrabPass ("") 直接关闭。
+            if (TryDisableMosaicShaderPasses(material, keywords, out var passDetail))
+            {
+                changed = changed ?? new StringBuilder(64);
+                changed.Append(passDetail).Append(' ');
+            }
+
             if (changed == null) return false;
             detail = changed.ToString().TrimEnd();
             return true;
         }
+
+        private static readonly string[] ExtraMosaicPassTags = { "", "Always", "SRPDefaultUnlit" };
+        private static Texture2D _zeroLidBakeTex;
+
+        private static Texture2D GetOrCreateZeroBakeTex()
+        {
+            if (_zeroLidBakeTex != null) return _zeroLidBakeTex;
+
+            var tex = new Texture2D(4, 4, TextureFormat.RGBA32, false, true);
+            tex.name = "Demosaic_ZeroLIDBake";
+            tex.hideFlags = HideFlags.HideAndDontSave;
+            tex.filterMode = FilterMode.Point;
+            var colors = new Color32[16];
+            tex.SetPixels32(colors);
+            tex.Apply(false, true);
+            _zeroLidBakeTex = tex;
+            return tex;
+        }
+
+        private bool TryDisableMosaicShaderPasses(Material material, string[] keywords, out string info)
+        {
+            info = null;
+            if (material == null) return false;
+
+            try
+            {
+                int passCount = material.passCount;
+                if (passCount <= 1) return false;
+
+                List<string> disabledPasses = null;
+
+                for (int p = 0; p < passCount; p++)
+                {
+                    string passName = material.GetPassName(p) ?? string.Empty;
+                    if (!string.IsNullOrEmpty(passName) && MosaicDetector.ContainsAny(passName, keywords))
+                    {
+                        if (material.GetShaderPassEnabled(passName))
+                        {
+                            material.SetShaderPassEnabled(passName, false);
+                            disabledPasses = disabledPasses ?? new List<string>(8);
+                            disabledPasses.Add(passName);
+                        }
+                    }
+                }
+
+                // 同时关闭无名 GrabPass ("") 以及无 LightMode 标签的默认附加通道 ("Always" / "SRPDefaultUnlit")，
+                // 并且每次复查都通过 GetShaderPassEnabled 检查：若组件 OnEnable / ApplyToMaterial 重新打开了通道，立刻再次关闭。
+                for (int i = 0; i < ExtraMosaicPassTags.Length; i++)
+                {
+                    string tag = ExtraMosaicPassTags[i];
+                    if (material.GetShaderPassEnabled(tag))
+                    {
+                        material.SetShaderPassEnabled(tag, false);
+                        disabledPasses = disabledPasses ?? new List<string>(8);
+                        disabledPasses.Add(tag.Length == 0 ? "\"\"" : tag);
+                    }
+                }
+
+                // 针对 LightID (LIDPatched) 材质：游戏在接触动作时通过 MaterialPropertyBlock 写入 _LID_Enabled=1，
+                // 触发顶点着色器 (if (_LID_BakedLength > 0)) 读取 _LID_Bake 把模型拉扯截断成粗大块状柱体。
+                // 将 _LID_BakedLength / _LID_Length / _LID_BlendshapeCount 置 0 并把 _LID_Bake 替换为全 0 贴图，
+                // 使顶点着色器在入口处直接跳过变形分支，接触时也保持原始精细网格与正常立体光影。
+                if (material.HasProperty("_LID_Bake"))
+                {
+                    var zeroTex = GetOrCreateZeroBakeTex();
+                    var curTex = material.GetTexture("_LID_Bake");
+                    float bakedLen = material.HasProperty("_LID_BakedLength") ? material.GetFloat("_LID_BakedLength") : 0f;
+                    if (curTex != zeroTex || bakedLen != 0f)
+                    {
+                        material.SetTexture("_LID_Bake", zeroTex);
+                        if (material.HasProperty("_LID_BakedLength"))
+                            material.SetFloat("_LID_BakedLength", 0f);
+                        if (material.HasProperty("_LID_Length"))
+                            material.SetFloat("_LID_Length", 0f);
+                        if (material.HasProperty("_LID_BlendshapeCount"))
+                            material.SetFloat("_LID_BlendshapeCount", 0f);
+                        if (material.HasProperty("_LID_Enabled"))
+                            material.SetFloat("_LID_Enabled", 0f);
+                        disabledPasses = disabledPasses ?? new List<string>(8);
+                        disabledPasses.Add("_LID_BakedLength→0,_LID_Bake→Zero");
+                    }
+                }
+
+                if (disabledPasses == null || disabledPasses.Count == 0) return false;
+                info = "PassOff:" + string.Join(",", disabledPasses);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug($"关闭材质马赛克 Pass 失败 {material.name}: {ex.Message}");
+                return false;
+            }
+        }
+
         /// <summary>按命名约定猜可能的关键字名；结果按属性名缓存，避免每轮复查重复拼接（属性名集合很稳定）。</summary>
         private string[] GuessKeywords(string propertyName)
         {
@@ -269,6 +401,8 @@ private bool ZeroMaterialMosaicProperties(Material material, out string detail)
             {
                 "_" + upper + "_ON",
                 upper + "_ON",
+                "LID_MOSAIC",
+                "_LID_MOSAIC",
                 "_LID_MOSAIC_ON",
                 "LID_MOSAIC_ON",
                 "_LID_MOSAICENABLED_ON",
@@ -326,6 +460,7 @@ private bool ZeroMaterialMosaicProperties(Material material, out string detail)
         private readonly List<Renderer> _materialFixTargets = new List<Renderer>();
         private readonly HashSet<int> _materialFixIds = new HashSet<int>();
         private readonly Dictionary<int, ShaderPropEntry[]> _shaderPropCache = new Dictionary<int, ShaderPropEntry[]>();
+        private readonly Dictionary<int, bool> _shaderHasMosaicPassCache = new Dictionary<int, bool>();
         // 关键字猜测结果按属性名缓存：原实现每轮每属性都要 ToUpperInvariant + 拼 8 个字符串
         private readonly Dictionary<string, string[]> _keywordGuessCache = new Dictionary<string, string[]>();
 

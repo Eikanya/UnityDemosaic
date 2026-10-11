@@ -13,6 +13,7 @@
 - **Renderer 材质 setter Hook**：实时捕获游戏运行时动态赋值的马赛克材质（零延迟）
 - **动态方法拦截**：按方法名关键词禁用游戏中施加马赛克的函数（高级功能）
 - **组件开关归零**：关闭挂在组件字段上的马赛克开关（如 LightID 的 `LIDPenetrator.enableMosaic`），**不替换材质槽**，适合"马赛克与本体共用同一材质"的游戏
+- **材质属性归零与马赛克 Pass 精准禁用**：自动归零材质上的马赛克属性、关闭马赛克 Shader Keyword，并枚举材质内所有渲染通道（Pass），**精准关闭命名的马赛克 Pass（如 `LID_MOSAIC`）及配套抓屏 `GrabPass`（`""`）**，完美保留同材质前序 Pass 的器官渲染与顶点形变
 - **白名单排除**：排除词机制防止误伤正常对象
 
 ### 处理模式
@@ -24,30 +25,39 @@
 | Disable | 禁用整个 GameObject | 中 |
 | Destroy（仅 Mono） | 物理销毁对象 | 高，可能导致 NullReference |
 
-### 第三条处理路径：组件开关归零（`EnableMosaicSwitchOff`）
+### 第三与第四条处理路径：组件开关归零 + 同材质马赛克 Pass 精准禁用（`EnableMosaicSwitchOff` / `EnableMaterialMosaicOff`）
 
-有些游戏的马赛克既不是独立物件、也不在材质槽上，而是**挂在组件字段上的 shader 效果**：
+有些游戏的马赛克既不是独立物件、也不在独立材质槽上，而是**与器官本体共用同一个模型、同一个材质**（典型如 `PaconeSoft.LightID.LIDPenetrator` 打补丁生成的 `Hidden/LIDPatched/...` 合成 Shader）：
 
 ```csharp
-// 典型例子：PaconeSoft.LightID.LIDPenetrator
+// 1. 组件侧字段（LIDPenetrator）
 enableMosaic  = true;      // 主开关
 mosaicMinPx   = 4f;        // 最小马赛克块（像素）
-mosaicRatio   = 0.02f;     // 块大小 = 屏幕长边 × 该比例
-mosaicColor.a = 1f;        // alpha 控制「原图 ↔ 马赛克」混合比例
-ApplyToMaterial();         // 把上面这些推给该 mesh 自己的材质
+mosaicRatio   = 10f;       // 块大小比例
+mosaicColor.a = 1f;        // 颜色与混合比例
+ApplyToMaterial();         // 同步给材质
+
+// 2. 材质/Shader 侧内部流水线（Hidden/LIDPatched/.../Opaque 共 5 个 Pass）
+// Pass 0: "FORWARD"        -> 绘制器官本体 + LightID 物理插入顶点形变
+// Pass 1: "FORWARD_ADD"    -> 附加光源 + LightID 顶点形变
+// Pass 2: "SHADOW_CASTER"  -> 投射阴影
+// Pass 3: "" (GrabPass)    -> 将刚画好器官的屏幕抓屏至 _LIDMosaicBGTexture
+// Pass 4: "LID_MOSAIC"     -> 用 Geometry + Pixel Shader 在器官包围框上绘制网格马赛克
 ```
 
-这类马赛克的**材质名 / 对象名 / Shader 名里都没有关键词**，靠名字维度匹配不到；而一旦靠别的维度匹配上，
-上面三种模式的动作（替换材质槽 / 禁用对象 / 销毁）会把**器官本体一起弄没**。
+这类马赛克如果用传统方式处理会遇到两难：
+- **如果删材质 / 换普通 Shader / 禁用对象**：Pass 0~2 也没了，器官本体会直接消失，或者失去 LightID 插入形变而穿模；
+- **如果只改组件字段或材质参数**：在开启了 `LID_SingleVariantMode` 的游戏里，编译后的 Pass 4 GPU 字节码（DXBC）直接裁掉了 `_LID_MosaicEnabled` 分支，并用 `imax(..., 4)` 将马赛克块锁死最小 4 像素、将输出 Alpha 硬编码为 `1.0`，导致 CPU 侧怎么改数值或拦函数都关不掉马赛克。
 
-所以插件提供第三条路：**只关组件字段，不碰材质槽**。
+因此插件通过**“组件 + 材质属性 + 关键字 + Pass 通道”四级联动**彻底解决（默认全自动开启，零配置生效）：
 
-- 按 `MosaicSwitchComponentTypes` 找到目标组件（默认 `LIDPenetrator`）；
-- 把名称命中 `MosaicSwitchFieldKeywords` 的字段归零：bool → `false`，float/int → `0`，Color → alpha 设为 `MosaicSwitchColorAlpha`；
-- 调用 `MosaicSwitchApplyMethods` 里列出的无参方法（默认 `ApplyToMaterial`）把新值同步给材质；
-- 每 `MosaicSwitchRecheckInterval` 秒复查一次，游戏重新打开马赛克时会再关掉。
-
-> 这套组件属于 [PaconeSoft LightID] 系统，同作者/同系作品共用，改一次即可覆盖。
+1. **组件开关归零（`EnableMosaicSwitchOff`）**：找到 `LIDPenetrator` 等组件，将 `enableMosaic` / `mosaicRatio` / `mosaicMinPx` / `mosaicColor` 归零并调用 `ApplyToMaterial`；
+2. **材质属性与关键字归零（`EnableMaterialMosaicOff` + `EnableMosaicKeywordOff`）**：将材质上的 `_LID_Mosaic*` 等属性归零，并关闭 `[Toggle]` 关联的局部/全局关键字（含 `LID_MOSAIC`）；
+3. **同材质马赛克 Pass 手术刀级禁用 + 防块状拉扯变形（核心）**：通过 `material.passCount` 与 `material.GetPassName(p)` 遍历材质所有渲染通道，一旦发现通道名匹配马赛克关键词（如 Pass 4 `"LID_MOSAIC"`），立即调用：
+   - `material.SetShaderPassEnabled("LID_MOSAIC", false)` —— 关掉马赛克绘制通道；
+   - `material.SetShaderPassEnabled("", false)` —— 同步关掉前序无名 `GrabPass`（断掉抓屏数据源并节省显卡开销）；
+   - 将 `_LID_BakedLength` / `_LID_Length` / `_LID_BlendshapeCount` / `_LID_Enabled` 置 `0` 并将 `_LID_Bake` 替换为全零贴图，防止接触动作时被 `MaterialPropertyBlock` 触发粗大块状网格变形；
+   - **Pass 0~2（`FORWARD` / `FORWARD_ADD` / `SHADOW_CASTER`）原样保留**，从而同时实现“彻底去码 + 100% 保留原始精细模型与光影”。
 
 ### 性能设计
 
@@ -134,6 +144,12 @@ ApplyToMaterial();         // 把上面这些推给该 mesh 自己的材质
 | `MosaicSwitchColorAlpha` | `0` | Color 类字段要设置的 alpha 值（本作 0 = 完全原图；语义相反的游戏改成 1） |
 | `MosaicSwitchRecheckInterval` | `1` | 组件开关复查间隔（秒），`0` 禁用 |
 | `ExportSwitchKey` | `F9` | 导出场景中的马赛克开关组件（字段现值 + 目标材质 shaderKeywords）到日志 |
+| `ScanCandidatesKey` | `F8` | 扫描并导出场景可疑马赛克物件、材质属性与门控组件到日志 |
+| `EnableMaterialMosaicOff` | `true` | 归零材质上的马赛克属性，并自动禁用材质内的马赛克 Shader Pass（如 `LID_MOSAIC` 与配套无名 `GrabPass`） |
+| `MosaicMaterialPropertyKeywords` | `mosaic` | 材质上要处理的马赛克属性名 / Pass 名关键词，逗号分隔 |
+| `MosaicMaterialShaderKeywords` | *(空)* | 限定仅处理 Shader 名含此关键词的材质（留空表示不限制） |
+| `EnableMosaicKeywordOff` | `true` | 同时关闭材质局部与全局的马赛克 Shader Keyword（含 `[Toggle]` 关键字与 `LID_MOSAIC`） |
+| `MosaicForceRepatch` | `false` | 修改组件开关后重启一次组件（实验项，默认关） |
 | `DisableMethods` | `false` | 方法名拦截（谨慎使用） |
 | `MethodDisableKeywords` | `mosaic,censor,moza` | 方法拦截关键词 |
 | `MethodExcludeKeywords` | `remove,destroy,clear,disable,hide,off,delete,undo,stop,cancel` | 方法排除词（防止误杀去马赛克方法） |
@@ -220,28 +236,28 @@ dotnet build Demosaic-mono/DemosaicPlugin.csproj -c Release
 
 ### 某个部位（例如男性性器官）去不了码，或者反而整个消失了
 
-这是**两种失败模式同时存在**的典型症状，根因通常不是关键词没调好，而是这个部位的马赛克**长在它自己的材质/组件上**：
+这是**两种失败模式同时存在**的典型症状，根因通常不是关键词没调好，而是这个部位的马赛克**长在它自己的材质/组件/Shader Pass 上**：
 
 | 症状 | 机制 |
 |------|------|
-| 去不了码 | 马赛克开关是组件字段（如 `LIDPenetrator.enableMosaic`），对象名 / 材质名 / Shader 名里**一个关键词都没有** ⇒ 所有名字维度全部落空 |
-| 反而消失 | 一旦靠别的维度（或你手动加的关键词）匹配上，Smart 模式的动作是**替换材质槽为透明**，而马赛克与本体**共用同一个材质槽** ⇒ 本体一起透明 |
+| 去不了码 | 马赛克是同材质追加的独立 Pass（如 `Hidden/LIDPatched/...` 的 `GrabPass` + `LID_MOSAIC` Pass）或组件字段（如 `LIDPenetrator.enableMosaic`），对象名 / 材质名 / Shader 名里**一个关键词都没有** ⇒ 名字维度全部落空 |
+| 反而消失 / 失去形变 | 一旦靠名字维度匹配上并走 Smart/Transparent 替换材质槽或换普通 Shader，由于马赛克与器官本体及 LightID 形变**共用同一个材质与 Shader** ⇒ 本体一起透明或失去插入形变 |
 
 排查顺序：
 
-1. 按 `F11` 导出场景，找到那个部位的 `GO / Material / Shader / Mesh`：
+1. 按 `F11` 或 `F8` 导出场景，找到那个部位的 `GO / Material / Shader / Mesh`：
    ```
    [Demosaic Export] GO: MALE_penis | Material: Panis_Mat (Instance) | Shader: Hidden/LIDPatched/<hash>/Opaque | Mesh: MALE_penis
    ```
-   Shader 名带 `LIDPatched` 就属于本文说的组件字段型马赛克。
+   Shader 名带 `LIDPatched` 就属于同材质内嵌马赛克（Pass 0~2 画器官与形变，Pass 3 `""` GrabPass，Pass 4 `"LID_MOSAIC"` 画网格马赛克）。
 2. 按 `F9` 导出开关组件，确认字段现值与目标材质：
    ```
-   [Demosaic Switch] PaconeSoft.LightID.LIDPenetrator on 'MALE_penis' | enableMosaic=True | mosaicRatio=0.02 | ... | target='MALE_penis' | mat[0]=Panis_Mat shader=Hidden/LIDPatched/.../Opaque keywords=[]
+   [Demosaic Switch] PaconeSoft.LightID.LIDPenetrator on 'Penis' | enableMosaic=False* | ... | mat[0]=Penis-D.001 (Instance) shader=Hidden/LIDPatched/.../Opaque
    ```
-3. 靠 `EnableMosaicSwitchOff`（默认已开）把它关掉即可 —— **不要**把 `LIDPatched` / 部位名加进 `ShaderNameKeywords` / `ObjectNameKeywords`，那会走替换材质槽的路径，把本体一起弄没。
+3. 靠默认开启的 `EnableMaterialMosaicOff` + `EnableMosaicSwitchOff` 自动关掉材质内的 `LID_MOSAIC` Pass、无名 `GrabPass` 以及材质/组件属性即可 —— **不要**把 `LIDPatched` / 部位名加进 `ShaderNameKeywords` / `ObjectNameKeywords`，否则会把整个材质槽替换成透明，导致器官本体消失。
 
-> 判断"码是烤在贴图里、还是运行时效果"：看该 Shader/组件有没有开关与尺寸参数，以及 `mosaicColor` 这类混合色字段。
-> 有开关（`enableMosaic` / `mosaicRatio` / `mosaicMinPx`）就说明**原图数据仍在**，只是被像素化效果盖住了，关掉即可出原图。
+> 判断"码是烤在贴图里、还是运行时效果"：看该 Shader/组件有没有开关与尺寸参数（`_LID_MosaicMinPx` / `_LID_MosaicRatio`）或独立马赛克 Pass（`LID_MOSAIC`）。
+> 只要存在这些属性或 Pass，就说明**贴图本身无码**，只是在渲染流水线末尾被追加的 Pass 像素化覆盖了，精准禁用对应 Pass 即可还原清晰贴图与形变。
 
 
 ### IL2CPP 不 Hook 材质 setter
@@ -273,7 +289,7 @@ IL2CPP 环境下 `GetTexturePropertyNameIDs` 可能触发 `AccessViolationExcept
 |------|------|
 | `Demosaic.Core/DemosaicEngine.cs` | 引擎主文件：生命周期、场景扫描（时间预算分批）、监视列表、事件钩子、Camera/Decal 检测、导出、Harmony 安装 |
 | `Demosaic.Core/DemosaicEngine.Switch.cs` | 引擎 partial：组件开关归零（类型解析、实例缓存、字段反射计划） |
-| `Demosaic.Core/DemosaicEngine.MaterialFix.cs` | 引擎 partial：材质马赛克属性归零（Shader 属性探针、关键字处理） |
+| `Demosaic.Core/DemosaicEngine.MaterialFix.cs` | 引擎 partial：材质马赛克属性归零、关键字关闭、同材质马赛克 Shader Pass（如 `LID_MOSAIC` + `GrabPass`）精准禁用 |
 | `Demosaic.Core/DemosaicEngine.Diagnostics.cs` | 引擎 partial：F8 候选扫描 / F9 开关导出 / 资源与门控诊断 |
 | `Demosaic.Core/DemosaicSettings.cs` | 配置定义、关键词解析、旧版配置迁移 |
 | `Demosaic.Core/MosaicDetector.cs` | 多维判定 + 全维度缓存 |

@@ -265,7 +265,8 @@ private static Renderer TryGetTargetRenderer(object target, Type type)
         /// </summary>
         private object[] GetSwitchInstances(Type type)
         {
-            bool refresh = _switchInstancesRefreshedAt < 0f ||
+            bool refresh = _switchDirty ||
+                           _switchInstancesRefreshedAt < 0f ||
                            Time.time - _switchInstancesRefreshedAt >= SwitchInstanceRefreshSeconds;
 
             if (!refresh && _switchInstanceCache.TryGetValue(type, out var cached))
@@ -281,7 +282,7 @@ private static Renderer TryGetTargetRenderer(object target, Type type)
             try
             {
 #if DEMOSAIC_IL2CPP
-                var instances = Object.FindObjectsOfType(Il2CppType.From(type));
+                var instances = Object.FindObjectsOfType(Il2CppType.From(type), true);
 #else
                 var instances = Object.FindObjectsOfType(type, true);
 #endif
